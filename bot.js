@@ -1,3 +1,4 @@
+import sodium from 'libsodium-wrappers';
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Events } from 'discord.js';
 import {
