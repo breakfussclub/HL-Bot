@@ -12,7 +12,7 @@ import {
 } from '@discordjs/voice';
 import Parser from 'rss-parser';
 import { spawn } from 'node:child_process';
-import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
+import ffmpeg from 'ffmpeg-static';
 
 const {
   DISCORD_TOKEN,
@@ -30,7 +30,7 @@ const REFRESH_RSS_MS = 60 * 60 * 1000; // check hourly
 const REJOIN_DELAY_MS = 5000;
 const START_AT_OLDEST = true;
 const SELF_DEAFEN = true;
-const FF_PATH = ffmpegInstaller.path;
+const FF_PATH = ffmpeg;
 
 const client = new Client({
   intents: [
