@@ -28,7 +28,6 @@ const REFRESH_RSS_MS = 60 * 60 * 1000; // refresh feed hourly
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 const FETCH_HEADERS = {
-  // Some podcast CDNs care about UA/accept
   'User-Agent': 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)',
   'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8'
 };
@@ -61,21 +60,18 @@ async function fetchEpisodes() {
       })
       .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
 
-    items.sort((a, b) => a.pubDate - b.pubDate); // oldest → newest
+    items.sort((a, b) => a.pubDate - b.pubDate);
     if (items.length) {
       episodes = items;
       console.log(`RSS Loaded: ${episodes.length} episodes`);
-    } else {
-      console.warn('RSS loaded but found 0 playable items; keeping previous list.');
     }
   } catch (err) {
     console.error('RSS fetch failed:', err?.message || err);
   }
 }
 
-// ─── HTTP fetch → Node Readable (handles redirects + headers) ─────────────────
+// ─── HTTP fetch → Node Readable ───────────────────────────────────────────────
 async function getAudioReadable(url) {
-  // Node 18+ has global fetch. We follow redirects and pass friendly headers.
   const res = await fetch(url, {
     method: 'GET',
     redirect: 'follow',
@@ -86,40 +82,30 @@ async function getAudioReadable(url) {
     throw new Error(`HTTP ${res.status} from audio URL`);
   }
 
-  // Convert WHATWG ReadableStream to Node Readable
-  const nodeReadable = Readable.fromWeb(res.body);
-  return { stream: nodeReadable, finalUrl: res.url };
+  return Readable.fromWeb(res.body);
 }
 
-// ─── FFmpeg: Read from stdin (podcast bytes) → WebM/Opus to stdout ───────────
-function ffmpegFromReadable(readable) {
+// ─── FFmpeg: stdin MP3 → stdout OGG/Opus (Discord-compatible) ─────────────────
+function ffmpegOggOpus(readable) {
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-    // Important when input comes from stdin:
-    '-f', 'mp3',           // Anchor/Spotify enclosures are MP3; hint format for stability
-    '-i', 'pipe:0',        // read audio from stdin
+    '-f', 'mp3',
+    '-i', 'pipe:0',
     '-vn',
     '-ac', '2',
     '-ar', '48000',
     '-c:a', 'libopus',
     '-b:a', '128k',
-    '-application', 'audio',
-    '-frame_duration', '60',
-    '-f', 'webm',
+    '-f', 'ogg',
     'pipe:1'
   ];
 
   const child = spawn(ffmpeg, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
-  // Pipe fetched audio into ffmpeg stdin
-  readable.on('error', (e) => {
-    console.error('Input stream error:', e?.message || e);
-    try { child.stdin.end(); } catch {}
-  });
+  readable.on('error', e => console.error('Input stream error:', e?.message || e));
   readable.pipe(child.stdin);
 
-  // Debug: surface ffmpeg warnings/errors
   child.stderr.on('data', d => {
     const line = d.toString().trim();
     if (line) console.log('[ffmpeg]', line);
@@ -140,39 +126,33 @@ async function playCurrent() {
   console.log(`▶️  Now Playing: ${ep.title}`);
 
   try {
-    // 1) Fetch audio ourselves (follow redirects, set headers)
-    const { stream: inputReadable, finalUrl } = await getAudioReadable(ep.url);
-    console.log(`Fetching audio from: ${finalUrl}`);
+    const inputReadable = await getAudioReadable(ep.url);
+    const oggOut = ffmpegOggOpus(inputReadable);
 
-    // 2) Pipe into ffmpeg; 3) Pipe webm/opus into Discord
-    const webmOut = ffmpegFromReadable(inputReadable);
-
-    // Watchdog: if no bytes leave ffmpeg in 8s, skip to next track
     let gotData = false;
     const watchdog = setTimeout(() => {
       if (!gotData) {
-        console.warn('No audio bytes from ffmpeg after 8s — skipping track.');
-        try { webmOut.destroy(); } catch {}
-        episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
+        console.warn('No audio bytes after 8s — skipping track.');
+        try { oggOut.destroy(); } catch {}
+        episodeIndex = (episodeIndex + 1) % episodes.length;
         setTimeout(loopPlay, 1_500);
       }
     }, 8000);
 
-    webmOut.once('data', () => {
+    oggOut.once('data', () => {
       gotData = true;
       clearTimeout(watchdog);
       console.log('Audio stream started.');
     });
 
-    const resource = createAudioResource(webmOut, {
-      inputType: StreamType.WebmOpus,
-      inlineVolume: false
+    const resource = createAudioResource(oggOut, {
+      inputType: StreamType.OggOpus
     });
 
     player.play(resource);
   } catch (err) {
     console.error('Playback error:', err?.message || err);
-    episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
+    episodeIndex = (episodeIndex + 1) % episodes.length;
     setTimeout(loopPlay, 2_000);
   }
 }
@@ -185,22 +165,21 @@ function loopPlay() {
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
-  episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
+  episodeIndex = (episodeIndex + 1) % episodes.length;
   setTimeout(loopPlay, 1_500);
 });
 
-player.on('error', (err) => {
+player.on('error', err => {
   console.error('AudioPlayer error:', err?.message || err);
-  episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
+  episodeIndex = (episodeIndex + 1) % episodes.length;
   setTimeout(loopPlay, 2_000);
 });
 
 // ─── Voice Connection ─────────────────────────────────────────────────────────
 let connection = null;
-
 async function ensureConnection() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
-  if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID is not a voice channel I can access.');
+  if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID must be a voice channel.');
 
   if (!connection) {
     connection = joinVoiceChannel({
@@ -211,34 +190,30 @@ async function ensureConnection() {
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      console.warn('Voice disconnected — attempting recovery…');
+      console.warn('Voice disconnected — retrying…');
       try {
         await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+          entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5000)
         ]);
-        console.log('Reconnected without rejoin.');
       } catch {
         setTimeout(() => {
           try { connection?.destroy(); } catch {}
           connection = null;
-          ensureConnection().catch(err => console.error('Rejoin failed:', err?.message || err));
+          ensureConnection();
         }, REJOIN_DELAY_MS);
       }
     });
 
     connection.subscribe(player);
   }
-
-  return connection;
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 async function main() {
-  await sodium.ready; // ensure encryption provider is ready first
-
+  await sodium.ready;
   await client.login(DISCORD_TOKEN);
-  console.log(`✅ Logged in as ${client.user?.tag || 'bot'}`);
+  console.log(`✅ Logged in as ${client.user?.tag}`);
 
   await fetchEpisodes();
   setInterval(fetchEpisodes, REFRESH_RSS_MS);
