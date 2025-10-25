@@ -1,4 +1,3 @@
-import sodium from 'libsodium-wrappers';
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Events } from 'discord.js';
 import {
@@ -14,6 +13,7 @@ import {
 import Parser from 'rss-parser';
 import { spawn } from 'node:child_process';
 import ffmpeg from 'ffmpeg-static';
+import sodium from 'libsodium-wrappers';
 
 const {
   DISCORD_TOKEN,
@@ -27,7 +27,7 @@ if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
   process.exit(1);
 }
 
-const REFRESH_RSS_MS = 60 * 60 * 1000; // check hourly
+const REFRESH_RSS_MS = 60 * 60 * 1000;
 const REJOIN_DELAY_MS = 5000;
 const START_AT_OLDEST = true;
 const SELF_DEAFEN = true;
@@ -80,7 +80,8 @@ function ffmpegStream(url) {
     '-ac', '2',
     '-ar', '48000',
     '-c:a', 'libopus',
-    '-f', 'opus',
+    '-b:a', '128k',     // ✅ bitrate
+    '-f', 'ogg',       // ✅ OGG container so Discord accepts it
     'pipe:1'
   ];
   const child = spawn(FF_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] });
