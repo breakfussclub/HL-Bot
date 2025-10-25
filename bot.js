@@ -13,21 +13,18 @@ import {
 import Parser from 'rss-parser';
 import { spawn } from 'node:child_process';
 import ffmpeg from 'ffmpeg-static';
-import sodium from 'libsodium-wrappers'; // encryption provider for Discord voice
+import sodium from 'libsodium-wrappers';
 
-// ─── Env ──────────────────────────────────────────────────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL } = process.env;
 if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
   console.error('Missing env. Set DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL');
   process.exit(1);
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-const REFRESH_RSS_MS = 60 * 60 * 1000; // refresh feed hourly
+const REFRESH_RSS_MS = 60 * 60 * 1000;
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
-// ─── Discord Client / Voice Player ────────────────────────────────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
@@ -36,7 +33,6 @@ const player = createAudioPlayer({
   behaviors: { noSubscriber: NoSubscriberBehavior.Play }
 });
 
-// ─── RSS Handling ─────────────────────────────────────────────────────────────
 const parser = new Parser({ headers: { 'User-Agent': 'discord-podcast-radio/1.0' } });
 let episodes = [];
 let episodeIndex = 0;
@@ -55,20 +51,16 @@ async function fetchEpisodes() {
       })
       .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
 
-    items.sort((a, b) => a.pubDate - b.pubDate); // oldest → newest
-
+    items.sort((a, b) => a.pubDate - b.pubDate);
     if (items.length) {
       episodes = items;
       console.log(`RSS Loaded: ${episodes.length} episodes`);
-    } else {
-      console.warn('RSS loaded but found 0 playable items; keeping previous list.');
     }
   } catch (err) {
     console.error('RSS fetch failed:', err?.message || err);
   }
 }
 
-// ─── FFmpeg Pipeline: MP3 → PCM (s16le @ 48kHz stereo) ────────────────────────
 function ffmpegPCM(url) {
   const args = [
     '-hide_banner',
@@ -80,19 +72,18 @@ function ffmpegPCM(url) {
     '-vn',
     '-ac', '2',
     '-ar', '48000',
-    '-f', 's16le',             // <-- raw PCM for maximum compatibility
+    '-f', 's16le',
     'pipe:1'
   ];
   const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  child.stderr.on('data', () => {}); // keep logs clean
+  child.stderr.on('data', () => {});
   return child.stdout;
 }
 
-// ─── Playback Loop ────────────────────────────────────────────────────────────
 async function playCurrent() {
   if (!episodes.length) {
     console.log('No episodes yet; retrying in 30s…');
-    setTimeout(loopPlay, 30_000);
+    setTimeout(loopPlay, 30000);
     return;
   }
 
@@ -102,43 +93,40 @@ async function playCurrent() {
   try {
     const pcm = ffmpegPCM(ep.url);
     const resource = createAudioResource(pcm, {
-      inputType: StreamType.Raw,  // raw PCM stream
+      inputType: StreamType.Raw,
       inlineVolume: false
     });
     player.play(resource);
   } catch (err) {
     console.error('Playback error:', err?.message || err);
-    // skip to next and try again
     episodeIndex = (episodeIndex + 1) % episodes.length;
-    setTimeout(loopPlay, 2_000);
+    setTimeout(loopPlay, 2000);
   }
 }
 
 function loopPlay() {
   playCurrent().catch(err => {
     console.error('Loop error:', err?.message || err);
-    setTimeout(loopPlay, 5_000);
+    setTimeout(loopPlay, 5000);
   });
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
-  // track finished → advance
-  episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
-  setTimeout(loopPlay, 1_500);
+  episodeIndex = (episodeIndex + 1) % episodes.length;
+  setTimeout(loopPlay, 1500);
 });
 
-player.on('error', (err) => {
+player.on('error', err => {
   console.error('AudioPlayer error:', err?.message || err);
-  episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
-  setTimeout(loopPlay, 2_000);
+  episodeIndex = (episodeIndex + 1) % episodes.length;
+  setTimeout(loopPlay, 2000);
 });
 
-// ─── Voice Connection ─────────────────────────────────────────────────────────
 let connection = null;
 
 async function ensureConnection() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
-  if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID is not a voice channel I can access.');
+  if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID must be a voice channel.');
 
   if (!connection) {
     connection = joinVoiceChannel({
@@ -149,34 +137,29 @@ async function ensureConnection() {
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      console.warn('Voice disconnected — attempting recovery…');
+      console.warn('Voice disconnected — retrying…');
       try {
         await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+          entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5000)
         ]);
-        console.log('Reconnected without rejoin.');
       } catch {
         setTimeout(() => {
           try { connection?.destroy(); } catch {}
           connection = null;
-          ensureConnection().catch(err => console.error('Rejoin failed:', err?.message || err));
+          ensureConnection();
         }, REJOIN_DELAY_MS);
       }
     });
 
     connection.subscribe(player);
   }
-
-  return connection;
 }
 
-// ─── Boot ─────────────────────────────────────────────────────────────────────
 async function main() {
-  await sodium.ready; // ensure encryption provider ready
-
+  await sodium.ready;
   await client.login(DISCORD_TOKEN);
-  console.log(`✅ Logged in as ${client.user?.tag || 'bot'}`);
+  console.log(`✅ Logged in as ${client.user?.tag}`);
 
   await fetchEpisodes();
   setInterval(fetchEpisodes, REFRESH_RSS_MS);
@@ -185,7 +168,6 @@ async function main() {
   loopPlay();
 }
 
-// graceful shutdown (Railway sends SIGTERM on redeploy)
 process.on('SIGTERM', () => {
   try { connection?.destroy(); } catch {}
   process.exit(0);
