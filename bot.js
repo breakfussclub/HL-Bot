@@ -7,31 +7,28 @@ import {
   createAudioResource,
   AudioPlayerStatus,
   entersState,
-  VoiceConnectionStatus,
-  demuxProbe
+  VoiceConnectionStatus
 } from '@discordjs/voice';
 import Parser from 'rss-parser';
 import { spawn } from 'node:child_process';
 import ffmpeg from 'ffmpeg-static';
-import sodium from 'libsodium-wrappers';
+import sodium from 'libsodium-wrappers'; // ensures encryption support for Discord voice
 
 const {
   DISCORD_TOKEN,
   VOICE_CHANNEL_ID,
-  GUILD_ID,
   RSS_URL
 } = process.env;
 
 if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
-  console.error('Missing env. You must set DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL');
+  console.error('Missing env. You must set DISCORD_TOKEN, VOICE_CHANNEL_ID, and RSS_URL');
   process.exit(1);
 }
 
-const REFRESH_RSS_MS = 60 * 60 * 1000;
+// Config
+const REFRESH_RSS_MS = 60 * 60 * 1000; // Refresh RSS hourly
 const REJOIN_DELAY_MS = 5000;
-const START_AT_OLDEST = true;
 const SELF_DEAFEN = true;
-const FF_PATH = ffmpeg;
 
 const client = new Client({
   intents: [
@@ -47,6 +44,7 @@ const parser = new Parser({
 let episodes = [];
 let episodeIndex = 0;
 let connection = null;
+
 const player = createAudioPlayer({
   behaviors: { noSubscriber: NoSubscriberBehavior.Play }
 });
@@ -64,14 +62,14 @@ async function fetchEpisodes() {
     })
     .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
 
-  items.sort((a, b) => a.pubDate - b.pubDate);
+  items.sort((a, b) => a.pubDate - b.pubDate); // oldest → newest
   if (items.length) episodes = items;
 
   console.log(`RSS Loaded: ${episodes.length} episodes`);
 }
 
-function ffmpegStream(url) {
-  const args = [
+function ffmpegPCM(url) {
+  return spawn(ffmpeg, [
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
@@ -79,59 +77,14 @@ function ffmpegStream(url) {
     '-vn',
     '-ac', '2',
     '-ar', '48000',
-    '-c:a', 'libopus',
-    '-b:a', '128k',     // ✅ bitrate
-    '-f', 'ogg',       // ✅ OGG container so Discord accepts it
+    '-f', 's16le', // ✅ PCM output
     'pipe:1'
-  ];
-  const child = spawn(FF_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  child.stderr.on('data', () => {});
-  return child.stdout;
-}
-
-async function resourceFromUrl(url) {
-  const stream = ffmpegStream(url);
-  const { stream: probed, type } = await demuxProbe(stream);
-  return createAudioResource(probed, { inputType: type });
-}
-
-async function ensureConnection() {
-  const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
-  if (!channel || channel.type !== 2) {
-    throw new Error('VOICE_CHANNEL_ID must be a voice channel.');
-  }
-
-  if (connection) return connection;
-
-  connection = joinVoiceChannel({
-    channelId: channel.id,
-    guildId: channel.guild.id,
-    adapterCreator: channel.guild.voiceAdapterCreator,
-    selfDeaf: SELF_DEAFEN
-  });
-
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    console.warn('Voice disconnected — trying to recover...');
-    try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5000)
-      ]);
-    } catch {
-      setTimeout(() => {
-        connection.destroy();
-        connection = null;
-        ensureConnection().catch(console.error);
-      }, REJOIN_DELAY_MS);
-    }
-  });
-
-  connection.subscribe(player);
-  return connection;
+  ], { stdio: ['ignore', 'pipe', 'ignore'] }).stdout;
 }
 
 async function playCurrent() {
   if (!episodes.length) {
+    console.log('No episodes yet — retrying...');
     setTimeout(loopPlay, 30000);
     return;
   }
@@ -140,7 +93,8 @@ async function playCurrent() {
   console.log(`▶️  Now Playing: ${ep.title}`);
 
   try {
-    const resource = await resourceFromUrl(ep.url);
+    const pcm = ffmpegPCM(ep.url);
+    const resource = createAudioResource(pcm, { inlineVolume: false });
     player.play(resource);
   } catch (err) {
     console.error('Playback error:', err.message);
@@ -154,6 +108,42 @@ function loopPlay() {
     console.error('Loop error:', err.message);
     setTimeout(loopPlay, 5000);
   });
+}
+
+async function ensureConnection() {
+  const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
+  if (!channel || channel.type !== 2) {
+    throw new Error('VOICE_CHANNEL_ID is not a valid voice channel.');
+  }
+
+  if (!connection) {
+    connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: channel.guild.id,
+      adapterCreator: channel.guild.voiceAdapterCreator,
+      selfDeaf: SELF_DEAFEN
+    });
+
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      console.warn('Voice disconnected — attempting recovery...');
+      try {
+        await Promise.race([
+          entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5000)
+        ]);
+      } catch {
+        setTimeout(() => {
+          connection.destroy();
+          connection = null;
+          ensureConnection().catch(console.error);
+        }, REJOIN_DELAY_MS);
+      }
+    });
+
+    connection.subscribe(player);
+  }
+
+  return connection;
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
