@@ -84,8 +84,7 @@ function ffmpegPCM(url) {
     'pipe:1'
   ];
   const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  // Optional: surface ffmpeg errors to logs without crashing
-  child.stderr.on('data', d => {/* suppress noisy ffmpeg output */});
+  child.stderr.on('data', () => {}); // keep logs clean
   return child.stdout;
 }
 
@@ -174,8 +173,7 @@ async function ensureConnection() {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 async function main() {
-  // Ensure encryption library is ready before voice starts
-  await sodium.ready;
+  await sodium.ready; // ensure encryption provider ready
 
   await client.login(DISCORD_TOKEN);
   console.log(`✅ Logged in as ${client.user?.tag || 'bot'}`);
