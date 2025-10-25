@@ -14,6 +14,7 @@ import Parser from 'rss-parser';
 import { spawn } from 'node:child_process';
 import ffmpeg from 'ffmpeg-static';
 import sodium from 'libsodium-wrappers';
+import { Readable } from 'node:stream';
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL } = process.env;
@@ -26,6 +27,11 @@ if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
 const REFRESH_RSS_MS = 60 * 60 * 1000; // refresh feed hourly
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
+const FETCH_HEADERS = {
+  // Some podcast CDNs care about UA/accept
+  'User-Agent': 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)',
+  'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8'
+};
 
 // ─── Discord Client / Voice Player ────────────────────────────────────────────
 const client = new Client({
@@ -56,7 +62,6 @@ async function fetchEpisodes() {
       .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
 
     items.sort((a, b) => a.pubDate - b.pubDate); // oldest → newest
-
     if (items.length) {
       episodes = items;
       console.log(`RSS Loaded: ${episodes.length} episodes`);
@@ -68,17 +73,32 @@ async function fetchEpisodes() {
   }
 }
 
-// ─── FFmpeg: MP3 → WebM/Opus (libopus) ────────────────────────────────────────
-// We output WebM/Opus so Discord can consume pre-encoded Opus directly.
-// This avoids any need for local Opus encoder modules.
-function ffmpegWebmOpus(url) {
+// ─── HTTP fetch → Node Readable (handles redirects + headers) ─────────────────
+async function getAudioReadable(url) {
+  // Node 18+ has global fetch. We follow redirects and pass friendly headers.
+  const res = await fetch(url, {
+    method: 'GET',
+    redirect: 'follow',
+    headers: FETCH_HEADERS
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`HTTP ${res.status} from audio URL`);
+  }
+
+  // Convert WHATWG ReadableStream to Node Readable
+  const nodeReadable = Readable.fromWeb(res.body);
+  return { stream: nodeReadable, finalUrl: res.url };
+}
+
+// ─── FFmpeg: Read from stdin (podcast bytes) → WebM/Opus to stdout ───────────
+function ffmpegFromReadable(readable) {
   const args = [
     '-hide_banner',
-    '-loglevel', 'error',
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-i', url,
+    '-loglevel', 'warning',
+    // Important when input comes from stdin:
+    '-f', 'mp3',           // Anchor/Spotify enclosures are MP3; hint format for stability
+    '-i', 'pipe:0',        // read audio from stdin
     '-vn',
     '-ac', '2',
     '-ar', '48000',
@@ -86,12 +106,25 @@ function ffmpegWebmOpus(url) {
     '-b:a', '128k',
     '-application', 'audio',
     '-frame_duration', '60',
-    // WebM container carrying Opus
     '-f', 'webm',
     'pipe:1'
   ];
-  const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  child.stderr.on('data', () => {}); // keep logs clean
+
+  const child = spawn(ffmpeg, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  // Pipe fetched audio into ffmpeg stdin
+  readable.on('error', (e) => {
+    console.error('Input stream error:', e?.message || e);
+    try { child.stdin.end(); } catch {}
+  });
+  readable.pipe(child.stdin);
+
+  // Debug: surface ffmpeg warnings/errors
+  child.stderr.on('data', d => {
+    const line = d.toString().trim();
+    if (line) console.log('[ffmpeg]', line);
+  });
+
   return child.stdout;
 }
 
@@ -107,10 +140,31 @@ async function playCurrent() {
   console.log(`▶️  Now Playing: ${ep.title}`);
 
   try {
-    const webmStream = ffmpegWebmOpus(ep.url);
+    // 1) Fetch audio ourselves (follow redirects, set headers)
+    const { stream: inputReadable, finalUrl } = await getAudioReadable(ep.url);
+    console.log(`Fetching audio from: ${finalUrl}`);
 
-    // IMPORTANT: tell discord the exact stream type so it doesn't try to decode/encode.
-    const resource = createAudioResource(webmStream, {
+    // 2) Pipe into ffmpeg; 3) Pipe webm/opus into Discord
+    const webmOut = ffmpegFromReadable(inputReadable);
+
+    // Watchdog: if no bytes leave ffmpeg in 8s, skip to next track
+    let gotData = false;
+    const watchdog = setTimeout(() => {
+      if (!gotData) {
+        console.warn('No audio bytes from ffmpeg after 8s — skipping track.');
+        try { webmOut.destroy(); } catch {}
+        episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
+        setTimeout(loopPlay, 1_500);
+      }
+    }, 8000);
+
+    webmOut.once('data', () => {
+      gotData = true;
+      clearTimeout(watchdog);
+      console.log('Audio stream started.');
+    });
+
+    const resource = createAudioResource(webmOut, {
       inputType: StreamType.WebmOpus,
       inlineVolume: false
     });
@@ -118,8 +172,7 @@ async function playCurrent() {
     player.play(resource);
   } catch (err) {
     console.error('Playback error:', err?.message || err);
-    // Skip to next and keep going
-    episodeIndex = (episodeIndex + 1) % episodes.length;
+    episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
     setTimeout(loopPlay, 2_000);
   }
 }
@@ -132,7 +185,6 @@ function loopPlay() {
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
-  // Track finished → advance
   episodeIndex = (episodeIndex + 1) % Math.max(1, episodes.length);
   setTimeout(loopPlay, 1_500);
 });
@@ -195,7 +247,6 @@ async function main() {
   loopPlay();
 }
 
-// graceful shutdown (Railway sends SIGTERM on redeploy)
 process.on('SIGTERM', () => {
   try { connection?.destroy(); } catch {}
   process.exit(0);
