@@ -1,3 +1,4 @@
+// Higher-er Podcast v1.js — thresholded resume (300s) with fresh ffmpeg on resume/restart
 import 'dotenv/config';
 import { Client, GatewayIntentBits } from 'discord.js';
 import {
@@ -29,13 +30,16 @@ const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
 const OPUS_BITRATE = '96k';
-const OPUS_CHANNELS = '2';
+the const OPUS_CHANNELS = '2';
 const OPUS_APP = 'audio';
 
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
 const FETCH_ACCEPT = 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8';
 
 const STARTUP_WATCHDOG_MS = 45000; // RELIABLE_MODE
+
+// ✅ New: threshold for when to restart instead of resuming offset
+const RESUME_RESTART_THRESHOLD_MS = 300 * 1000; // 300s = 5 minutes
 
 // ───────────────────── Discord Client ─────────────────────
 const client = new Client({
@@ -278,9 +282,10 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   const humans = channel.members.filter(m => !m.user.bot);
 
   if (humans.size === 0) {
+    // Pause logic: accumulate elapsed, mark paused, kill ffmpeg
     if (player.state.status === AudioPlayerStatus.Playing) {
       const elapsed = Math.max(0, Date.now() - (startedAtMs || Date.now()));
-      resumeOffsetMs += elapsed;
+      resumeOffsetMs += elapsed; // total played for threshold + resume
       isPausedDueToEmpty = true;
       try { player.pause(); } catch {}
       try { ffmpegProc?.kill('SIGKILL'); } catch {}
@@ -290,6 +295,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     return;
   }
 
+  // First listener ever since boot
   if (!hasStartedPlayback) {
     hasStartedPlayback = true;
     console.log('🎧 First listener joined — starting playback.');
@@ -297,13 +303,32 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     return;
   }
 
+  // Resume logic with threshold:
+  // - If played < 5m total, resume from last position (fresh ffmpeg @ offset)
+  // - If played ≥ 5m, restart episode from beginning (fresh ffmpeg @ 0)
+  const overThreshold = resumeOffsetMs >= RESUME_RESTART_THRESHOLD_MS;
+
   if (isPausedDueToEmpty) {
-    console.log(`▶️  Listener joined — resuming @ ${hms(resumeOffsetMs)}.`);
-    isPausedDueToEmpty = false;
-    playCurrent();
+    if (overThreshold) {
+      console.log(`🔁 Returning listener — episode played ${hms(resumeOffsetMs)}, above 5m threshold, restarting from the beginning.`);
+      resumeOffsetMs = 0;
+      isPausedDueToEmpty = false;
+      playCurrent();
+    } else {
+      console.log(`▶️  Listener returned — resuming from ${hms(resumeOffsetMs)} (under threshold).`);
+      isPausedDueToEmpty = false;
+      playCurrent(); // fresh ffmpeg at resumeOffsetMs
+    }
   } else if (player.state.status === AudioPlayerStatus.Paused) {
-    try { player.unpause(); } catch {}
-    console.log('▶️  Listener joined — unpaused.');
+    // Safety: treat any paused state with the same threshold behavior
+    if (overThreshold) {
+      console.log(`🔁 Returning listener — episode played ${hms(resumeOffsetMs)}, above 5m threshold, restarting from the beginning.`);
+      resumeOffsetMs = 0;
+      playCurrent();
+    } else {
+      console.log(`▶️  Listener returned — resuming from ${hms(resumeOffsetMs)} (under threshold).`);
+      playCurrent();
+    }
   }
 });
 
