@@ -15,7 +15,6 @@ import { spawn } from 'node:child_process';
 import ffmpeg from 'ffmpeg-static';
 import sodium from 'libsodium-wrappers';
 import axios from 'axios';
-import { Readable } from 'node:stream';
 
 // ─────────────────────────── ENV ───────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL } = process.env;
@@ -31,7 +30,7 @@ const SELF_DEAFEN = true;
 
 // Audio encode: quality/bandwidth balance
 const OPUS_BITRATE = '96k';
-const OPUS_CHANNELS = '2';                       // stereo
+the const OPUS_CHANNELS = '2';                    // stereo
 const OPUS_APP = 'audio';
 
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
@@ -46,7 +45,7 @@ const client = new Client({
 });
 
 const player = createAudioPlayer({
-  behaviors: { noSubscriber: NoSubscriberBehavior.Play }, // stay connected
+  behaviors: { noSubscriber: NoSubscriberBehavior.Play }, // stay connected even if alone
 });
 
 // ───────────────────── Presence helpers ────────────────────
@@ -98,8 +97,7 @@ function inferInputFormat(contentType = '') {
   const ct = String(contentType).toLowerCase();
   if (ct.includes('mpeg')) return 'mp3';
   if (ct.includes('x-m4a') || ct.includes('mp4') || ct.includes('aac')) return 'mp4'; // m4a container
-  // Unknown → let ffmpeg guess
-  return null;
+  return null; // let ffmpeg guess
 }
 
 async function axiosStream(url, headers = {}) {
@@ -109,12 +107,10 @@ async function axiosStream(url, headers = {}) {
     headers: {
       'User-Agent': FETCH_UA,
       'Accept': FETCH_ACCEPT,
-      // Encourage fast start on some hosts:
-      'Range': 'bytes=0-',
+      'Range': 'bytes=0-', // encourage fast starts
       ...headers,
     },
-    // timeouts (ms)
-    timeout: 60000,
+    timeout: 60000, // 60s HTTP timeout
   });
   return res;
 }
@@ -122,23 +118,21 @@ async function axiosStream(url, headers = {}) {
 function spawnFfmpegFromStream(stream, fmt /* 'mp3' | 'mp4' | null */, offsetMs = 0) {
   const preSeekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
 
-  // For non-seekable stdin, -ss BEFORE -i makes FFmpeg decode & drop until target.
-  // This is accurate, but may take time for very large offsets (typical resume offsets are small).
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
 
-    // Robust network defaults still help downstream muxing:
-    '-protocol_whitelist', 'file,http,https,tcp,tls',
+    // IMPORTANT: allow pipe for stdin + common protocols
+    '-protocol_whitelist', 'file,http,https,tcp,tls,pipe',
 
-    // Pre-decode skip from start (stdin is not seekable):
+    // Pre-decode skip from start (stdin not seekable): R1 resume
     '-ss', preSeekSec,
 
     // Input over stdin
     ...(fmt ? ['-f', fmt] : []),
     '-i', 'pipe:0',
 
-    // Encode to Opus OGG (clean & efficient):
+    // Encode to Opus OGG (clean & efficient)
     '-vn',
     '-ac', OPUS_CHANNELS,
     '-ar', '48000',
@@ -160,7 +154,8 @@ function spawnFfmpegFromStream(stream, fmt /* 'mp3' | 'mp4' | null */, offsetMs 
     if (line) console.log('[ffmpeg]', line);
   });
 
-  child.stdin.on('error', () => {}); // ignore EPIPE on early exits
+  // Ignore EPIPE if ffmpeg dies early
+  child.stdin.on('error', () => {});
 
   return child;
 }
@@ -204,7 +199,7 @@ async function playCurrent() {
     const res = await axiosStream(currentEpisode.url);
     const inputFmt = inferInputFormat(res.headers?.['content-type']);
 
-    // 2) Pipe to FFmpeg (stdin) with pre-decode skip for resume (R1 + SR2-equivalent)
+    // 2) Pipe to FFmpeg (stdin) with pre-decode skip for resume (R1)
     ffmpegProc = spawnFfmpegFromStream(res.data, inputFmt, resumeOffsetMs);
 
     // Startup watchdog (RELIABLE_MODE = 45s)
