@@ -19,12 +19,12 @@ import axios from 'axios';
 // ─────────────────────────── ENV ───────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL } = process.env;
 if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
-  console.error('Missing env. Set DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL');
+  console.error('❌ Missing env. Set DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL');
   process.exit(1);
 }
 
-// ─────────────────────── Config / Tunables ─────────────────
-const REFRESH_RSS_MS = 60 * 60 * 1000; // refresh feed hourly
+// ─────────────────────── Config ───────────────────────
+const REFRESH_RSS_MS = 60 * 60 * 1000;
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
@@ -37,7 +37,7 @@ const FETCH_ACCEPT = 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8';
 
 const STARTUP_WATCHDOG_MS = 45000; // RELIABLE_MODE
 
-// ───────────────── Discord client / player ────────────────
+// ───────────────────── Discord Client ─────────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
@@ -46,22 +46,21 @@ const player = createAudioPlayer({
   behaviors: { noSubscriber: NoSubscriberBehavior.Play },
 });
 
-// ───────────────────── Presence helpers ────────────────────
+// ───────────────────── Presence ─────────────────────
 function cleanTitleForStatus(title) {
   if (!title) return 'Podcast';
-  let t = String(title)
+  return String(title)
     .replace(/\.[^/.]+$/, '')
     .replace(/[-_]+/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim();
-  t = t.replace(/\b\w/g, (c) => c.toUpperCase());
-  return t || 'Podcast';
+    .trim()
+    .replace(/\b\w/g, c => c.toUpperCase()) || 'Podcast';
 }
 function setListeningStatus(title) {
   try { client.user?.setActivity(cleanTitleForStatus(title), { type: 2 }); } catch {}
 }
 
-// ───────────────────── RSS fetching / order ───────────────
+// ───────────────────── RSS Fetch ─────────────────────
 const parser = new Parser({ headers: { 'User-Agent': 'discord-podcast-radio/1.0' } });
 let episodes = [];
 let episodeIndex = 0;
@@ -72,53 +71,45 @@ async function fetchEpisodes() {
     const items = (feed.items || [])
       .map((it) => {
         const url = it?.enclosure?.url || it?.link || it?.guid;
-        return {
-          title: it?.title || 'Untitled',
-          url,
-          pubDate: it?.pubDate ? new Date(it.pubDate).getTime() : 0,
-        };
+        return { title: it?.title || 'Untitled', url, pubDate: it?.pubDate ? new Date(it.pubDate).getTime() : 0 };
       })
-      .filter((x) => typeof x.url === 'string' && x.url.startsWith('http'));
+      .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
+
     items.sort((a, b) => a.pubDate - b.pubDate);
     if (items.length) {
       episodes = items;
-      console.log(`RSS Loaded: ${episodes.length} episodes`);
+      console.log(`📻 RSS Loaded: ${episodes.length} episodes`);
     }
   } catch (err) {
-    console.error('RSS fetch failed:', err?.message || err);
+    console.error('❌ RSS fetch failed:', err?.message || err);
   }
 }
 
-// ─────────────── axios stream → FFmpeg (stdin) ─────────────
+// ───────────────────── Streaming Layer ─────────────────────
 function inferInputFormat(contentType = '') {
-  const ct = String(contentType).toLowerCase();
+  const ct = contentType.toLowerCase();
   if (ct.includes('mpeg')) return 'mp3';
   if (ct.includes('x-m4a') || ct.includes('mp4') || ct.includes('aac')) return 'mp4';
   return null;
 }
 
-async function axiosStream(url, headers = {}) {
+async function axiosStream(url) {
   return axios.get(url, {
     responseType: 'stream',
     maxRedirects: 5,
-    headers: {
-      'User-Agent': FETCH_UA,
-      'Accept': FETCH_ACCEPT,
-      'Range': 'bytes=0-',
-      ...headers,
-    },
+    headers: { 'User-Agent': FETCH_UA, 'Accept': FETCH_ACCEPT, 'Range': 'bytes=0-' },
     timeout: 60000,
   });
 }
 
 function spawnFfmpegFromStream(stream, fmt, offsetMs = 0) {
-  const preSeekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
+  const skipSec = Math.floor(offsetMs / 1000).toString();
 
   const args = [
     '-hide_banner',
-    '-loglevel', 'warning',
+    '-loglevel', 'error',
     '-protocol_whitelist', 'file,http,https,tcp,tls,pipe',
-    '-ss', preSeekSec,
+    '-ss', skipSec,
     ...(fmt ? ['-f', fmt] : []),
     '-i', 'pipe:0',
     '-vn',
@@ -133,15 +124,14 @@ function spawnFfmpegFromStream(stream, fmt, offsetMs = 0) {
 
   const child = spawn(ffmpeg, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
-  stream.on('error', (e) => console.error('HTTP stream error:', e?.message || e));
+  stream.on('error', () => {}); // CLEAN MODE
   stream.pipe(child.stdin);
-  child.stderr.on('data', (d) => console.log('[ffmpeg]', d.toString().trim()));
-  child.stdin.on('error', () => {});
+  child.stdin.on('error', () => {}); // ignore EPIPE on stop
 
   return child;
 }
 
-// ─────────────── Playback state ────────────────
+// ───────────────────── Playback State ─────────────────────
 let hasStartedPlayback = false;
 let isPausedDueToEmpty = false;
 let resumeOffsetMs = 0;
@@ -150,7 +140,7 @@ let ffmpegProc = null;
 let currentEpisode = null;
 let playLock = false;
 
-function msToHMS(ms) {
+function hms(ms) {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -158,35 +148,34 @@ function msToHMS(ms) {
   return (h ? `${h}:` : '') + `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
 }
 
-// ───────────────────── Play Loop ─────────────────────
+// ───────────────────── Main Playback ─────────────────────
 async function playCurrent() {
   if (playLock) return;
   playLock = true;
 
   try {
     if (!episodes.length) {
-      console.log('No episodes yet; retry in 30s…');
+      console.log('⏳ No episodes yet, retrying in 30s…');
       setTimeout(loopPlay, 30_000);
       return;
     }
 
     currentEpisode = episodes[episodeIndex % episodes.length];
-    console.log(`▶️  Now Playing: ${currentEpisode.title}${resumeOffsetMs ? ` (from ${msToHMS(resumeOffsetMs)})` : ''}`);
+    console.log(`▶️  Now Playing (${episodeIndex+1}/${episodes.length}): ${currentEpisode.title}${resumeOffsetMs ? ` (resume @ ${hms(resumeOffsetMs)})` : ''}`);
     setListeningStatus(currentEpisode.title);
 
     const res = await axiosStream(currentEpisode.url);
-    const inputFmt = inferInputFormat(res.headers?.['content-type']);
-
-    ffmpegProc = spawnFfmpegFromStream(res.data, inputFmt, resumeOffsetMs);
+    const fmt = inferInputFormat(res.headers?.['content-type']);
+    ffmpegProc = spawnFfmpegFromStream(res.data, fmt, resumeOffsetMs);
 
     let gotData = false;
     const watchdog = setTimeout(() => {
       if (!gotData && !isPausedDueToEmpty) {
-        console.warn('No audio bytes — skipping episode.');
+        console.warn('⚠️  Startup timeout — skipping episode.');
         try { ffmpegProc?.kill('SIGKILL'); } catch {}
         resumeOffsetMs = 0;
         episodeIndex = (episodeIndex + 1) % episodes.length;
-        setTimeout(loopPlay, 1500);
+        setTimeout(loopPlay, 1000);
       }
     }, STARTUP_WATCHDOG_MS);
 
@@ -194,7 +183,7 @@ async function playCurrent() {
       gotData = true;
       clearTimeout(watchdog);
       startedAtMs = Date.now();
-      console.log('Audio stream started.');
+      console.log('✅ Audio stream started.');
     });
 
     const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.OggOpus });
@@ -202,10 +191,10 @@ async function playCurrent() {
     isPausedDueToEmpty = false;
 
   } catch (err) {
-    console.error('Playback error:', err?.message || err);
+    console.error('❌ Playback error:', err?.message || err);
     resumeOffsetMs = 0;
     episodeIndex = (episodeIndex + 1) % episodes.length;
-    setTimeout(loopPlay, 2000);
+    setTimeout(loopPlay, 1000);
   } finally {
     playLock = false;
   }
@@ -213,29 +202,27 @@ async function playCurrent() {
 
 function loopPlay() {
   if (!hasStartedPlayback || isPausedDueToEmpty) return;
-  playCurrent().catch(err => {
-    console.error('Loop error:', err?.message || err);
-    setTimeout(loopPlay, 5000);
-  });
+  playCurrent().catch(() => setTimeout(loopPlay, 2000));
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
-  if (isPausedDueToEmpty) return;
-  resumeOffsetMs = 0;
-  episodeIndex = (episodeIndex + 1) % episodes.length;
-  setTimeout(loopPlay, 1500);
-});
-
-player.on('error', (err) => {
-  console.error('AudioPlayer error:', err?.message || err);
   if (!isPausedDueToEmpty) {
     resumeOffsetMs = 0;
     episodeIndex = (episodeIndex + 1) % episodes.length;
-    setTimeout(loopPlay, 2000);
+    setTimeout(loopPlay, 1000);
   }
 });
 
-// ───────────────── Voice Connection ─────────────────
+player.on('error', (err) => {
+  console.error('❌ AudioPlayer error:', err?.message || err);
+  if (!isPausedDueToEmpty) {
+    resumeOffsetMs = 0;
+    episodeIndex = (episodeIndex + 1) % episodes.length;
+    setTimeout(loopPlay, 1000);
+  }
+});
+
+// ───────────────────── Voice Handling ─────────────────────
 let connection = null;
 let keepAliveInterval = null;
 
@@ -252,7 +239,7 @@ function stopKeepAlive() {
 
 async function ensureConnection() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
-  if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID must be a voice channel.');
+  if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID must point to a voice channel');
 
   if (!connection) {
     connection = joinVoiceChannel({
@@ -263,7 +250,7 @@ async function ensureConnection() {
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      console.warn('Voice disconnected — retrying…');
+      console.warn('⚠️  Voice disconnected, retrying…');
       try {
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5000),
@@ -283,46 +270,44 @@ async function ensureConnection() {
   }
 }
 
-// ───────────────── Auto pause/resume ─────────────────
+// ───────────────────── Pause / Resume ─────────────────────
 client.on('voiceStateUpdate', (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
 
-  const humans = channel.members.filter((m) => !m.user.bot);
+  const humans = channel.members.filter(m => !m.user.bot);
 
   if (humans.size === 0) {
     if (player.state.status === AudioPlayerStatus.Playing) {
       const elapsed = Math.max(0, Date.now() - (startedAtMs || Date.now()));
       resumeOffsetMs += elapsed;
       isPausedDueToEmpty = true;
-
       try { player.pause(); } catch {}
       try { ffmpegProc?.kill('SIGKILL'); } catch {}
       ffmpegProc = null;
-
-      console.log(`[VC] No listeners — paused at ${msToHMS(resumeOffsetMs)}.`);
+      console.log(`⏸️  No listeners — paused @ ${hms(resumeOffsetMs)}.`);
     }
     return;
   }
 
   if (!hasStartedPlayback) {
     hasStartedPlayback = true;
-    console.log('[VC] First listener joined — starting playback.');
+    console.log('🎧 First listener joined — starting playback.');
     loopPlay();
     return;
   }
 
   if (isPausedDueToEmpty) {
-    console.log(`[VC] Listener joined — resuming from ${msToHMS(resumeOffsetMs)}.`);
+    console.log(`▶️  Listener joined — resuming @ ${hms(resumeOffsetMs)}.`);
     isPausedDueToEmpty = false;
     playCurrent();
   } else if (player.state.status === AudioPlayerStatus.Paused) {
     try { player.unpause(); } catch {}
-    console.log('[VC] Listener joined — unpaused.');
+    console.log('▶️  Listener joined — unpaused.');
   }
 });
 
-// ─────────────────────────── Boot ──────────────────────────
+// ───────────────────── Boot ─────────────────────
 async function main() {
   await sodium.ready;
   await client.login(DISCORD_TOKEN);
@@ -332,7 +317,7 @@ async function main() {
   setInterval(fetchEpisodes, REFRESH_RSS_MS);
 
   await ensureConnection();
-  console.log('[VC] Waiting for listeners… (will start on first join)');
+  console.log('[VC] Waiting for listeners…');
 }
 
 process.on('SIGTERM', () => {
@@ -343,6 +328,6 @@ process.on('SIGTERM', () => {
 });
 
 main().catch(err => {
-  console.error('Fatal boot error:', err?.message || err);
+  console.error('💀 Fatal boot error:', err?.message || err);
   process.exit(1);
 });
