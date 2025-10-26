@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import { Client, GatewayIntentBits } from 'discord.js';
 import {
   joinVoiceChannel,
   createAudioPlayer,
@@ -14,6 +14,8 @@ import Parser from 'rss-parser';
 import { spawn } from 'node:child_process';
 import ffmpeg from 'ffmpeg-static';
 import sodium from 'libsodium-wrappers';
+import axios from 'axios';
+import { Readable } from 'node:stream';
 
 // ─────────────────────────── ENV ───────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL } = process.env;
@@ -91,52 +93,53 @@ async function fetchEpisodes() {
   }
 }
 
-// ──────────────── HEAD preflight (resolve redirects) ───────
-// H1: HEAD only (no streaming), includes Range to encourage fast starts.
-async function resolveFinalUrl(urlIn) {
-  const res = await fetch(urlIn, {
-    method: 'HEAD',
-    redirect: 'follow',
+// ─────────────── axios stream → FFmpeg (stdin) ─────────────
+function inferInputFormat(contentType = '') {
+  const ct = String(contentType).toLowerCase();
+  if (ct.includes('mpeg')) return 'mp3';
+  if (ct.includes('x-m4a') || ct.includes('mp4') || ct.includes('aac')) return 'mp4'; // m4a container
+  // Unknown → let ffmpeg guess
+  return null;
+}
+
+async function axiosStream(url, headers = {}) {
+  const res = await axios.get(url, {
+    responseType: 'stream',
+    maxRedirects: 5,
     headers: {
       'User-Agent': FETCH_UA,
       'Accept': FETCH_ACCEPT,
+      // Encourage fast start on some hosts:
       'Range': 'bytes=0-',
+      ...headers,
     },
+    // timeouts (ms)
+    timeout: 60000,
   });
-  const finalUrl = res.url || urlIn;
-  const setCookie = res.headers.get('set-cookie') || '';
-  return { finalUrl, cookie: setCookie };
+  return res;
 }
 
-// ───────────── FFmpeg spawn (SR2 accurate seek + robust net) ─────────────
-// SR2 requires -ss AFTER -i for accurate seek; add reconnect & timeouts.
-function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
-  const seekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
-  const headerBlob =
-    `User-Agent: ${FETCH_UA}\r\n` +
-    `Accept: ${FETCH_ACCEPT}\r\n` +
-    (cookie ? `Cookie: ${cookie}\r\n` : '');
+function spawnFfmpegFromStream(stream, fmt /* 'mp3' | 'mp4' | null */, offsetMs = 0) {
+  const preSeekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
 
+  // For non-seekable stdin, -ss BEFORE -i makes FFmpeg decode & drop until target.
+  // This is accurate, but may take time for very large offsets (typical resume offsets are small).
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
 
-    // Network robustness for podcasts/CDNs:
+    // Robust network defaults still help downstream muxing:
     '-protocol_whitelist', 'file,http,https,tcp,tls',
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_on_network_error', '1',
-    '-reconnect_delay_max', '5',
-    // rw_timeout is in microseconds (45s here):
-    '-rw_timeout', String(45 * 1_000_000),
 
-    // Headers + input + accurate seek:
-    '-headers', headerBlob,
-    '-i', finalUrl,
-    '-ss', seekSec,                // SR2 accurate seek AFTER -i
-    '-vn',
+    // Pre-decode skip from start (stdin is not seekable):
+    '-ss', preSeekSec,
+
+    // Input over stdin
+    ...(fmt ? ['-f', fmt] : []),
+    '-i', 'pipe:0',
 
     // Encode to Opus OGG (clean & efficient):
+    '-vn',
     '-ac', OPUS_CHANNELS,
     '-ar', '48000',
     '-c:a', 'libopus',
@@ -147,11 +150,18 @@ function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
     'pipe:1',
   ];
 
-  const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(ffmpeg, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  stream.on('error', (e) => console.error('HTTP stream error:', e?.message || e));
+  stream.pipe(child.stdin);
+
   child.stderr.on('data', (d) => {
     const line = d.toString().trim();
     if (line) console.log('[ffmpeg]', line);
   });
+
+  child.stdin.on('error', () => {}); // ignore EPIPE on early exits
+
   return child;
 }
 
@@ -190,11 +200,12 @@ async function playCurrent() {
     );
     setListeningStatus(currentEpisode.title);
 
-    // Preflight: resolve redirects + cookies; HEAD only, no body streams
-    const { finalUrl, cookie } = await resolveFinalUrl(currentEpisode.url);
+    // 1) Axios GET stream (browser-like); hosts won't block this
+    const res = await axiosStream(currentEpisode.url);
+    const inputFmt = inferInputFormat(res.headers?.['content-type']);
 
-    // FFmpeg is the ONLY stream reader with robust network options
-    ffmpegProc = spawnFfmpegFromUrlResolved(finalUrl, cookie, resumeOffsetMs);
+    // 2) Pipe to FFmpeg (stdin) with pre-decode skip for resume (R1 + SR2-equivalent)
+    ffmpegProc = spawnFfmpegFromStream(res.data, inputFmt, resumeOffsetMs);
 
     // Startup watchdog (RELIABLE_MODE = 45s)
     let gotData = false;
