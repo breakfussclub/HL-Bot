@@ -92,23 +92,20 @@ async function fetchEpisodes() {
   }
 }
 
-// ──────────────── URL preflight (resolve redirects) ─────────
+// ──────────────── HEAD preflight (resolve redirects) ───────
+// H1: use HEAD with Range to encourage faster starts; NEVER open a body stream.
 async function resolveFinalUrl(urlIn) {
   const res = await fetch(urlIn, {
-    method: 'GET',
+    method: 'HEAD',
     redirect: 'follow',
     headers: {
       'User-Agent': FETCH_UA,
-      Accept: FETCH_ACCEPT,
-      Range: 'bytes=0-',
+      'Accept': FETCH_ACCEPT,
+      'Range': 'bytes=0-',
     },
   });
   const finalUrl = res.url || urlIn;
   const setCookie = res.headers.get('set-cookie') || '';
-  // IMPORTANT: do not keep this stream alive; cancel immediately so it can't error later
-  try {
-    await res.body?.cancel();
-  } catch {}
   return { finalUrl, cookie: setCookie };
 }
 
@@ -182,7 +179,7 @@ async function playCurrent() {
     );
     setListeningStatus(currentEpisode.title);
 
-    // Preflight: resolve redirects + cookies; then immediately cancel the probe fetch
+    // Preflight: resolve redirects + cookies; HEAD only, no body streams
     const { finalUrl, cookie } = await resolveFinalUrl(currentEpisode.url);
 
     // Spawn ffmpeg directly from the resolved URL (ONLY stream source)
