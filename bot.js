@@ -8,7 +8,7 @@ import {
   AudioPlayerStatus,
   entersState,
   VoiceConnectionStatus,
-  StreamType
+  StreamType,
 } from '@discordjs/voice';
 import Parser from 'rss-parser';
 import { spawn } from 'node:child_process';
@@ -27,23 +27,22 @@ const REFRESH_RSS_MS = 60 * 60 * 1000;           // refresh feed hourly
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
-const OPUS_BITRATE = '96k';                      // Option A (quality)
+const OPUS_BITRATE = '96k';                      // quality/bandwidth balance
 const OPUS_CHANNELS = '2';                       // stereo
-const OPUS_APP = 'audio';
+const OPUS_APP = 'audio';                        // music+speech friendly
 
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
 const FETCH_ACCEPT = 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8';
 
-// Startup / stall tolerance: some hosts are slow, give them time
-const STARTUP_WATCHDOG_MS = 20000;               // 20s before declaring "no bytes"
+const STARTUP_WATCHDOG_MS = 20000;               // wait up to 20s for first bytes
 
 // ───────────────── Discord client / player ────────────────
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
 const player = createAudioPlayer({
-  behaviors: { noSubscriber: NoSubscriberBehavior.Play }
+  behaviors: { noSubscriber: NoSubscriberBehavior.Play }, // stay connected
 });
 
 // ───────────────────── Presence helpers ────────────────────
@@ -54,7 +53,7 @@ function cleanTitleForStatus(title) {
     .replace(/[-_]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  t = t.replace(/\b\w/g, c => c.toUpperCase());
+  t = t.replace(/\b\w/g, (c) => c.toUpperCase());
   return t || 'Podcast';
 }
 
@@ -67,22 +66,23 @@ function setListeningStatus(title) {
 // ───────────────────── RSS fetching / order ───────────────
 const parser = new Parser({ headers: { 'User-Agent': 'discord-podcast-radio/1.0' } });
 let episodes = [];
-let episodeIndex = 0;
+let episodeIndex = 0; // E1: always starts at episode 1 (index 0) on restart
 
 async function fetchEpisodes() {
   try {
     const feed = await parser.parseURL(RSS_URL);
     const items = (feed.items || [])
-      .map(it => {
+      .map((it) => {
         const url = it?.enclosure?.url || it?.link || it?.guid;
         return {
           title: it?.title || 'Untitled',
           url,
-          pubDate: it?.pubDate ? new Date(it.pubDate).getTime() : 0
+          pubDate: it?.pubDate ? new Date(it.pubDate).getTime() : 0,
         };
       })
-      .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
-    items.sort((a, b) => a.pubDate - b.pubDate); // oldest → newest
+      .filter((x) => typeof x.url === 'string' && x.url.startsWith('http'));
+    // oldest → newest to loop chronologically
+    items.sort((a, b) => a.pubDate - b.pubDate);
     if (items.length) {
       episodes = items;
       console.log(`RSS Loaded: ${episodes.length} episodes`);
@@ -94,27 +94,26 @@ async function fetchEpisodes() {
 
 // ──────────────── URL preflight (resolve redirects) ─────────
 async function resolveFinalUrl(urlIn) {
-  // We intentionally let fetch follow redirects so we can capture final URL
   const res = await fetch(urlIn, {
     method: 'GET',
     redirect: 'follow',
     headers: {
       'User-Agent': FETCH_UA,
-      'Accept': FETCH_ACCEPT,
-      // Some hosts need an explicit Range to start quickly; small initial range helps
-      'Range': 'bytes=0-'
-    }
+      Accept: FETCH_ACCEPT,
+      Range: 'bytes=0-',
+    },
   });
-
-  // We don't actually read the body here; we just want final URL + cookies then abort
   const finalUrl = res.url || urlIn;
   const setCookie = res.headers.get('set-cookie') || '';
-  try { res.body?.cancel(); } catch {}
+  // IMPORTANT: do not keep this stream alive; cancel immediately so it can't error later
+  try {
+    await res.body?.cancel();
+  } catch {}
   return { finalUrl, cookie: setCookie };
 }
 
 // ───────────── FFmpeg spawn (SR2 accurate seek) ────────────
-// SR2 requires -ss AFTER -i so FFmpeg decodes accurately.
+// SR2 requires -ss AFTER -i so FFmpeg decodes accurately (sample-precise).
 function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
   const seekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
   const headerBlob =
@@ -127,7 +126,7 @@ function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
     '-loglevel', 'warning',
     '-headers', headerBlob,
     '-i', finalUrl,
-    '-ss', seekSec,             // SR2: accurate seek (after -i)
+    '-ss', seekSec,                // SR2: accurate seek AFTER -i
     '-vn',
     '-ac', OPUS_CHANNELS,
     '-ar', '48000',
@@ -135,12 +134,12 @@ function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
     '-b:a', OPUS_BITRATE,
     '-application', OPUS_APP,
     '-f', 'ogg',
-    'pipe:1'
+    'pipe:1',
   ];
 
   const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  child.stderr.on('data', d => {
+  child.stderr.on('data', (d) => {
     const line = d.toString().trim();
     if (line) console.log('[ffmpeg]', line);
   });
@@ -152,7 +151,7 @@ function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
 let hasStartedPlayback = false;     // start only when first listener joins
 let isPausedDueToEmpty = false;     // paused because VC empty
 let resumeOffsetMs = 0;             // cumulative offset into current episode
-let startedAtMs = 0;                // timestamp when current run began
+let startedAtMs = 0;                // when current run began (for offset calc)
 let ffmpegProc = null;              // current ffmpeg process
 let currentEpisode = null;          // {title,url,pubDate}
 let playLock = false;               // prevent overlapping plays
@@ -178,14 +177,18 @@ async function playCurrent() {
     }
 
     currentEpisode = episodes[episodeIndex % episodes.length];
-    console.log(`▶️  Now Playing: ${currentEpisode.title}${resumeOffsetMs ? ` (from ${msToHMS(resumeOffsetMs)})` : ''}`);
+    console.log(
+      `▶️  Now Playing: ${currentEpisode.title}${resumeOffsetMs ? ` (from ${msToHMS(resumeOffsetMs)})` : ''}`
+    );
     setListeningStatus(currentEpisode.title);
 
-    // Preflight to get final URL + cookies (some hosts block direct FFmpeg)
+    // Preflight: resolve redirects + cookies; then immediately cancel the probe fetch
     const { finalUrl, cookie } = await resolveFinalUrl(currentEpisode.url);
 
+    // Spawn ffmpeg directly from the resolved URL (ONLY stream source)
     ffmpegProc = spawnFfmpegFromUrlResolved(finalUrl, cookie, resumeOffsetMs);
 
+    // Give slow hosts time to start sending bytes
     let gotData = false;
     const watchdog = setTimeout(() => {
       if (!gotData && !isPausedDueToEmpty) {
@@ -206,7 +209,7 @@ async function playCurrent() {
     });
 
     const resource = createAudioResource(ffmpegProc.stdout, {
-      inputType: StreamType.OggOpus
+      inputType: StreamType.OggOpus,
     });
 
     player.play(resource);
@@ -223,7 +226,7 @@ async function playCurrent() {
 
 function loopPlay() {
   if (!hasStartedPlayback || isPausedDueToEmpty) return;
-  playCurrent().catch(err => {
+  playCurrent().catch((err) => {
     console.error('Loop error:', err?.message || err);
     setTimeout(loopPlay, 5000);
   });
@@ -236,7 +239,7 @@ player.on(AudioPlayerStatus.Idle, () => {
   setTimeout(loopPlay, 1500);
 });
 
-player.on('error', err => {
+player.on('error', (err) => {
   console.error('AudioPlayer error:', err?.message || err);
   if (isPausedDueToEmpty) return;
   resumeOffsetMs = 0;
@@ -271,7 +274,7 @@ async function ensureConnection() {
       channelId: channel.id,
       guildId: channel.guild.id,
       adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: SELF_DEAFEN
+      selfDeaf: SELF_DEAFEN,
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -279,7 +282,7 @@ async function ensureConnection() {
       try {
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5000)
+          entersState(connection, VoiceConnectionStatus.Connecting, 5000),
         ]);
       } catch {
         setTimeout(() => {
@@ -300,7 +303,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
 
-  const humans = channel.members.filter(m => !m.user.bot);
+  const humans = channel.members.filter((m) => !m.user.bot);
 
   // Empty: pause and record timestamp
   if (humans.size === 0) {
@@ -357,7 +360,7 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-main().catch(err => {
+main().catch((err) => {
   console.error('Fatal boot error:', err?.message || err);
   process.exit(1);
 });
