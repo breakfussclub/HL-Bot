@@ -30,7 +30,7 @@ const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
 const OPUS_BITRATE = '96k';
-the const OPUS_CHANNELS = '2';
+const OPUS_CHANNELS = '2';
 const OPUS_APP = 'audio';
 
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
