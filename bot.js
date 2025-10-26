@@ -27,14 +27,16 @@ const REFRESH_RSS_MS = 60 * 60 * 1000;           // refresh feed hourly
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
-const OPUS_BITRATE = '96k';                      // quality/bandwidth balance
+// Audio encode: quality/bandwidth balance
+const OPUS_BITRATE = '96k';
 const OPUS_CHANNELS = '2';                       // stereo
-const OPUS_APP = 'audio';                        // music+speech friendly
+const OPUS_APP = 'audio';
 
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
 const FETCH_ACCEPT = 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8';
 
-const STARTUP_WATCHDOG_MS = 20000;               // wait up to 20s for first bytes
+// RELIABLE_MODE: allow slow hosts time to send first bytes (45s)
+const STARTUP_WATCHDOG_MS = 45000;
 
 // ───────────────── Discord client / player ────────────────
 const client = new Client({
@@ -56,17 +58,14 @@ function cleanTitleForStatus(title) {
   t = t.replace(/\b\w/g, (c) => c.toUpperCase());
   return t || 'Podcast';
 }
-
 function setListeningStatus(title) {
-  try {
-    client.user?.setActivity(cleanTitleForStatus(title), { type: 2 }); // LISTENING
-  } catch {}
+  try { client.user?.setActivity(cleanTitleForStatus(title), { type: 2 }); } catch {}
 }
 
 // ───────────────────── RSS fetching / order ───────────────
 const parser = new Parser({ headers: { 'User-Agent': 'discord-podcast-radio/1.0' } });
 let episodes = [];
-let episodeIndex = 0; // E1: always starts at episode 1 (index 0) on restart
+let episodeIndex = 0; // E1: start from episode 1 (index 0) on restart
 
 async function fetchEpisodes() {
   try {
@@ -81,7 +80,7 @@ async function fetchEpisodes() {
         };
       })
       .filter((x) => typeof x.url === 'string' && x.url.startsWith('http'));
-    // oldest → newest to loop chronologically
+    // oldest → newest so we loop chronologically
     items.sort((a, b) => a.pubDate - b.pubDate);
     if (items.length) {
       episodes = items;
@@ -93,7 +92,7 @@ async function fetchEpisodes() {
 }
 
 // ──────────────── HEAD preflight (resolve redirects) ───────
-// H1: use HEAD with Range to encourage faster starts; NEVER open a body stream.
+// H1: HEAD only (no streaming), includes Range to encourage fast starts.
 async function resolveFinalUrl(urlIn) {
   const res = await fetch(urlIn, {
     method: 'HEAD',
@@ -109,8 +108,8 @@ async function resolveFinalUrl(urlIn) {
   return { finalUrl, cookie: setCookie };
 }
 
-// ───────────── FFmpeg spawn (SR2 accurate seek) ────────────
-// SR2 requires -ss AFTER -i so FFmpeg decodes accurately (sample-precise).
+// ───────────── FFmpeg spawn (SR2 accurate seek + robust net) ─────────────
+// SR2 requires -ss AFTER -i for accurate seek; add reconnect & timeouts.
 function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
   const seekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
   const headerBlob =
@@ -121,26 +120,38 @@ function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
+
+    // Network robustness for podcasts/CDNs:
+    '-protocol_whitelist', 'file,http,https,tcp,tls',
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_on_network_error', '1',
+    '-reconnect_delay_max', '5',
+    // rw_timeout is in microseconds (45s here):
+    '-rw_timeout', String(45 * 1_000_000),
+
+    // Headers + input + accurate seek:
     '-headers', headerBlob,
     '-i', finalUrl,
-    '-ss', seekSec,                // SR2: accurate seek AFTER -i
+    '-ss', seekSec,                // SR2 accurate seek AFTER -i
     '-vn',
+
+    // Encode to Opus OGG (clean & efficient):
     '-ac', OPUS_CHANNELS,
     '-ar', '48000',
     '-c:a', 'libopus',
     '-b:a', OPUS_BITRATE,
     '-application', OPUS_APP,
+
     '-f', 'ogg',
     'pipe:1',
   ];
 
   const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
   child.stderr.on('data', (d) => {
     const line = d.toString().trim();
     if (line) console.log('[ffmpeg]', line);
   });
-
   return child;
 }
 
@@ -182,10 +193,10 @@ async function playCurrent() {
     // Preflight: resolve redirects + cookies; HEAD only, no body streams
     const { finalUrl, cookie } = await resolveFinalUrl(currentEpisode.url);
 
-    // Spawn ffmpeg directly from the resolved URL (ONLY stream source)
+    // FFmpeg is the ONLY stream reader with robust network options
     ffmpegProc = spawnFfmpegFromUrlResolved(finalUrl, cookie, resumeOffsetMs);
 
-    // Give slow hosts time to start sending bytes
+    // Startup watchdog (RELIABLE_MODE = 45s)
     let gotData = false;
     const watchdog = setTimeout(() => {
       if (!gotData && !isPausedDueToEmpty) {
@@ -254,7 +265,6 @@ function startKeepAlive(conn) {
     try { conn?.configureNetworking(); } catch {}
   }, 15000);
 }
-
 function stopKeepAlive() {
   if (keepAliveInterval) {
     clearInterval(keepAliveInterval);
