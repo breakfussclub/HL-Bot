@@ -24,20 +24,18 @@ if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
 }
 
 // ─────────────────────── Config / Tunables ─────────────────
-const REFRESH_RSS_MS = 60 * 60 * 1000;           // refresh feed hourly
+const REFRESH_RSS_MS = 60 * 60 * 1000; // refresh feed hourly
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
-// Audio encode: quality/bandwidth balance
 const OPUS_BITRATE = '96k';
-the const OPUS_CHANNELS = '2';                    // stereo
+const OPUS_CHANNELS = '2';
 const OPUS_APP = 'audio';
 
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
 const FETCH_ACCEPT = 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8';
 
-// RELIABLE_MODE: allow slow hosts time to send first bytes (45s)
-const STARTUP_WATCHDOG_MS = 45000;
+const STARTUP_WATCHDOG_MS = 45000; // RELIABLE_MODE
 
 // ───────────────── Discord client / player ────────────────
 const client = new Client({
@@ -45,7 +43,7 @@ const client = new Client({
 });
 
 const player = createAudioPlayer({
-  behaviors: { noSubscriber: NoSubscriberBehavior.Play }, // stay connected even if alone
+  behaviors: { noSubscriber: NoSubscriberBehavior.Play },
 });
 
 // ───────────────────── Presence helpers ────────────────────
@@ -66,7 +64,7 @@ function setListeningStatus(title) {
 // ───────────────────── RSS fetching / order ───────────────
 const parser = new Parser({ headers: { 'User-Agent': 'discord-podcast-radio/1.0' } });
 let episodes = [];
-let episodeIndex = 0; // E1: start from episode 1 (index 0) on restart
+let episodeIndex = 0;
 
 async function fetchEpisodes() {
   try {
@@ -81,7 +79,6 @@ async function fetchEpisodes() {
         };
       })
       .filter((x) => typeof x.url === 'string' && x.url.startsWith('http'));
-    // oldest → newest so we loop chronologically
     items.sort((a, b) => a.pubDate - b.pubDate);
     if (items.length) {
       episodes = items;
@@ -96,50 +93,40 @@ async function fetchEpisodes() {
 function inferInputFormat(contentType = '') {
   const ct = String(contentType).toLowerCase();
   if (ct.includes('mpeg')) return 'mp3';
-  if (ct.includes('x-m4a') || ct.includes('mp4') || ct.includes('aac')) return 'mp4'; // m4a container
-  return null; // let ffmpeg guess
+  if (ct.includes('x-m4a') || ct.includes('mp4') || ct.includes('aac')) return 'mp4';
+  return null;
 }
 
 async function axiosStream(url, headers = {}) {
-  const res = await axios.get(url, {
+  return axios.get(url, {
     responseType: 'stream',
     maxRedirects: 5,
     headers: {
       'User-Agent': FETCH_UA,
       'Accept': FETCH_ACCEPT,
-      'Range': 'bytes=0-', // encourage fast starts
+      'Range': 'bytes=0-',
       ...headers,
     },
-    timeout: 60000, // 60s HTTP timeout
+    timeout: 60000,
   });
-  return res;
 }
 
-function spawnFfmpegFromStream(stream, fmt /* 'mp3' | 'mp4' | null */, offsetMs = 0) {
+function spawnFfmpegFromStream(stream, fmt, offsetMs = 0) {
   const preSeekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
 
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-
-    // IMPORTANT: allow pipe for stdin + common protocols
     '-protocol_whitelist', 'file,http,https,tcp,tls,pipe',
-
-    // Pre-decode skip from start (stdin not seekable): R1 resume
     '-ss', preSeekSec,
-
-    // Input over stdin
     ...(fmt ? ['-f', fmt] : []),
     '-i', 'pipe:0',
-
-    // Encode to Opus OGG (clean & efficient)
     '-vn',
     '-ac', OPUS_CHANNELS,
     '-ar', '48000',
     '-c:a', 'libopus',
     '-b:a', OPUS_BITRATE,
     '-application', OPUS_APP,
-
     '-f', 'ogg',
     'pipe:1',
   ];
@@ -148,26 +135,20 @@ function spawnFfmpegFromStream(stream, fmt /* 'mp3' | 'mp4' | null */, offsetMs 
 
   stream.on('error', (e) => console.error('HTTP stream error:', e?.message || e));
   stream.pipe(child.stdin);
-
-  child.stderr.on('data', (d) => {
-    const line = d.toString().trim();
-    if (line) console.log('[ffmpeg]', line);
-  });
-
-  // Ignore EPIPE if ffmpeg dies early
+  child.stderr.on('data', (d) => console.log('[ffmpeg]', d.toString().trim()));
   child.stdin.on('error', () => {});
 
   return child;
 }
 
-// ─────────────── Playback state & utilities ────────────────
-let hasStartedPlayback = false;     // start only when first listener joins
-let isPausedDueToEmpty = false;     // paused because VC empty
-let resumeOffsetMs = 0;             // cumulative offset into current episode
-let startedAtMs = 0;                // when current run began (for offset calc)
-let ffmpegProc = null;              // current ffmpeg process
-let currentEpisode = null;          // {title,url,pubDate}
-let playLock = false;               // prevent overlapping plays
+// ─────────────── Playback state ────────────────
+let hasStartedPlayback = false;
+let isPausedDueToEmpty = false;
+let resumeOffsetMs = 0;
+let startedAtMs = 0;
+let ffmpegProc = null;
+let currentEpisode = null;
+let playLock = false;
 
 function msToHMS(ms) {
   const s = Math.floor(ms / 1000);
@@ -177,7 +158,7 @@ function msToHMS(ms) {
   return (h ? `${h}:` : '') + `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
 }
 
-// ───────────────────── Main play / loop logic ──────────────
+// ───────────────────── Play Loop ─────────────────────
 async function playCurrent() {
   if (playLock) return;
   playLock = true;
@@ -190,25 +171,19 @@ async function playCurrent() {
     }
 
     currentEpisode = episodes[episodeIndex % episodes.length];
-    console.log(
-      `▶️  Now Playing: ${currentEpisode.title}${resumeOffsetMs ? ` (from ${msToHMS(resumeOffsetMs)})` : ''}`
-    );
+    console.log(`▶️  Now Playing: ${currentEpisode.title}${resumeOffsetMs ? ` (from ${msToHMS(resumeOffsetMs)})` : ''}`);
     setListeningStatus(currentEpisode.title);
 
-    // 1) Axios GET stream (browser-like); hosts won't block this
     const res = await axiosStream(currentEpisode.url);
     const inputFmt = inferInputFormat(res.headers?.['content-type']);
 
-    // 2) Pipe to FFmpeg (stdin) with pre-decode skip for resume (R1)
     ffmpegProc = spawnFfmpegFromStream(res.data, inputFmt, resumeOffsetMs);
 
-    // Startup watchdog (RELIABLE_MODE = 45s)
     let gotData = false;
     const watchdog = setTimeout(() => {
       if (!gotData && !isPausedDueToEmpty) {
-        console.warn('No audio bytes after startup window — skipping episode.');
+        console.warn('No audio bytes — skipping episode.');
         try { ffmpegProc?.kill('SIGKILL'); } catch {}
-        ffmpegProc = null;
         resumeOffsetMs = 0;
         episodeIndex = (episodeIndex + 1) % episodes.length;
         setTimeout(loopPlay, 1500);
@@ -222,12 +197,10 @@ async function playCurrent() {
       console.log('Audio stream started.');
     });
 
-    const resource = createAudioResource(ffmpegProc.stdout, {
-      inputType: StreamType.OggOpus,
-    });
-
+    const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.OggOpus });
     player.play(resource);
     isPausedDueToEmpty = false;
+
   } catch (err) {
     console.error('Playback error:', err?.message || err);
     resumeOffsetMs = 0;
@@ -240,14 +213,14 @@ async function playCurrent() {
 
 function loopPlay() {
   if (!hasStartedPlayback || isPausedDueToEmpty) return;
-  playCurrent().catch((err) => {
+  playCurrent().catch(err => {
     console.error('Loop error:', err?.message || err);
     setTimeout(loopPlay, 5000);
   });
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
-  if (isPausedDueToEmpty) return; // paused—do nothing
+  if (isPausedDueToEmpty) return;
   resumeOffsetMs = 0;
   episodeIndex = (episodeIndex + 1) % episodes.length;
   setTimeout(loopPlay, 1500);
@@ -255,13 +228,14 @@ player.on(AudioPlayerStatus.Idle, () => {
 
 player.on('error', (err) => {
   console.error('AudioPlayer error:', err?.message || err);
-  if (isPausedDueToEmpty) return;
-  resumeOffsetMs = 0;
-  episodeIndex = (episodeIndex + 1) % episodes.length;
-  setTimeout(loopPlay, 2000);
+  if (!isPausedDueToEmpty) {
+    resumeOffsetMs = 0;
+    episodeIndex = (episodeIndex + 1) % episodes.length;
+    setTimeout(loopPlay, 2000);
+  }
 });
 
-// ─────────────── Voice connection & keep-alive ─────────────
+// ───────────────── Voice Connection ─────────────────
 let connection = null;
 let keepAliveInterval = null;
 
@@ -272,10 +246,8 @@ function startKeepAlive(conn) {
   }, 15000);
 }
 function stopKeepAlive() {
-  if (keepAliveInterval) {
-    clearInterval(keepAliveInterval);
-    keepAliveInterval = null;
-  }
+  if (keepAliveInterval) clearInterval(keepAliveInterval);
+  keepAliveInterval = null;
 }
 
 async function ensureConnection() {
@@ -311,14 +283,13 @@ async function ensureConnection() {
   }
 }
 
-// ───────────── Auto pause/resume + wait for listener ───────
+// ───────────────── Auto pause/resume ─────────────────
 client.on('voiceStateUpdate', (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
 
   const humans = channel.members.filter((m) => !m.user.bot);
 
-  // Empty: pause and record timestamp
   if (humans.size === 0) {
     if (player.state.status === AudioPlayerStatus.Playing) {
       const elapsed = Math.max(0, Date.now() - (startedAtMs || Date.now()));
@@ -334,7 +305,6 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     return;
   }
 
-  // Someone joined:
   if (!hasStartedPlayback) {
     hasStartedPlayback = true;
     console.log('[VC] First listener joined — starting playback.');
@@ -363,7 +333,6 @@ async function main() {
 
   await ensureConnection();
   console.log('[VC] Waiting for listeners… (will start on first join)');
-  // Intentionally do not call loopPlay() here; wait for first listener.
 }
 
 process.on('SIGTERM', () => {
@@ -373,7 +342,7 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-main().catch((err) => {
+main().catch(err => {
   console.error('Fatal boot error:', err?.message || err);
   process.exit(1);
 });
