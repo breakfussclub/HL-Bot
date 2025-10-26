@@ -1,4 +1,4 @@
-// Higher-er Podcast v1.js — Tier 1 + Tier 2 + Auto Slash Registration (Guild + Global, hard sync)
+// Higher-er Podcast v1.js — Tier 1 + Tier 2 + In-message controls + SR1 tagging
 //
 // ENV (Railway):
 // DISCORD_TOKEN=...           (bot token)
@@ -9,9 +9,11 @@
 // ANNOUNCE_CHANNEL_ID=...     (text channel to post "Now Playing" embeds; optional)
 //
 // Notes:
-// - Commands are auto-registered to BOTH guild and global on startup (hard sync).
-// - Announcements post ONLY when a NEW episode starts (not on resume/skip).
-// - Playback is stable with 5m resume threshold (no silent resumes).
+// - Commands auto-register to BOTH guild and global on startup (hard sync).
+// - Now Playing embed posts ONLY when a NEW episode begins (not on mid-episode resume).
+// - Buttons appear under that embed: [⏯ Pause/Resume] [⏭ Skip] [🔁 Restart].
+// - Only users IN THE SAME VOICE CHANNEL may press the buttons (Option 2).
+// - SR1 tagging: tag ONLY when auto-resuming from empty VC; not on manual actions or first boot start.
 
 import 'dotenv/config';
 import {
@@ -25,6 +27,7 @@ import {
   Events,
   REST,
   Routes,
+  PermissionsBitField,
 } from 'discord.js';
 import {
   joinVoiceChannel,
@@ -69,8 +72,8 @@ const OPUS_APP = 'audio';
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
 const FETCH_ACCEPT = 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8';
 
-const STARTUP_WATCHDOG_MS = 45000;            // give ffmpeg time to start
-const RESUME_RESTART_THRESHOLD_MS = 300000;   // 5 minutes
+const STARTUP_WATCHDOG_MS = 45000;
+const RESUME_RESTART_THRESHOLD_MS = 300000; // 5 minutes
 
 // ───────────────────── Discord Client ─────────────────────
 const client = new Client({
@@ -170,9 +173,9 @@ function spawnFfmpegFromStream(stream, fmt, offsetMs = 0) {
 
   const child = spawn(ffmpeg, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
-  stream.on('error', () => {}); // swallow fetch stream errors
+  stream.on('error', () => {});
   stream.pipe(child.stdin);
-  child.stdin.on('error', () => {}); // ignore EPIPE on stop
+  child.stdin.on('error', () => {});
 
   return child;
 }
@@ -186,10 +189,13 @@ let ffmpegProc = null;
 let currentEpisode = null;
 let playLock = false;
 
-// Announcements
+// Announcements + Controls
 let announceChannel = null;
-let lastAnnouncedEpisodeIdx = -1; // announce only when this changes
+let lastAnnouncedEpisodeIdx = -1; // to avoid reposts on resume
+let lastNowPlayingMessage = null; // { channelId, messageId }
 
+// SR1 tagging
+let pendingStarterUserId = null; // set only when resuming from empty VC
 function hms(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(s / 3600);
@@ -198,8 +204,37 @@ function hms(ms) {
   return (h ? `${h}:` : '') + `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
 }
 
-// ───────────────────── Announcements (Tier 2) ─────────────────────
-function buildEpisodeEmbed(ep, index, total) {
+// ───────────────────── Controls Row (buttons) ─────────────────────
+const BTN_IDS = {
+  PAUSE: 'ctl_pause',
+  RESUME: 'ctl_resume',
+  SKIP: 'ctl_skip',
+  RESTART: 'ctl_restart',
+};
+
+function buildControlsRow(isPaused) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(isPaused ? BTN_IDS.RESUME : BTN_IDS.PAUSE)
+      .setStyle(ButtonStyle.Secondary)
+      .setLabel(isPaused ? 'Resume' : 'Pause')
+      .setEmoji(isPaused ? '▶️' : '⏯'),
+    new ButtonBuilder()
+      .setCustomId(BTN_IDS.SKIP)
+      .setStyle(ButtonStyle.Secondary)
+      .setLabel('Skip')
+      .setEmoji('⏭'),
+    new ButtonBuilder()
+      .setCustomId(BTN_IDS.RESTART)
+      .setStyle(ButtonStyle.Secondary)
+      .setLabel('Restart')
+      .setEmoji('🔁'),
+  );
+  return row;
+}
+
+// ───────────────────── Announcements (Tier 2 + buttons + SR1 tag) ─────────────────────
+function buildEpisodeEmbed(ep, index, total, starterUserId = null) {
   const published = ep.pubDate ? new Date(ep.pubDate).toLocaleString() : 'Unknown';
   const desc = (ep.description || '').slice(0, 300);
   const embed = new EmbedBuilder()
@@ -212,27 +247,60 @@ function buildEpisodeEmbed(ep, index, total) {
     )
     .setFooter({ text: 'Podcast Radio' });
 
+  if (starterUserId) {
+    embed.addFields({ name: 'Started by', value: `<@${starterUserId}>`, inline: false });
+  }
+
   const rows = [];
   if (ep.link || ep.url) {
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setLabel('Open Episode')
-        .setStyle(ButtonStyle.Link)
-        .setURL(ep.link || ep.url),
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setLabel('Open Episode')
+          .setStyle(ButtonStyle.Link)
+          .setURL(ep.link || ep.url),
+      )
     );
-    rows.push(row);
   }
+  // Controls row (playing state by default)
+  rows.push(buildControlsRow(false));
   return { embed, components: rows };
 }
 
-async function announceEpisodeStart(ep, idx, total) {
+async function announceEpisodeStart(ep, idx, total, starterUserId = null) {
   if (!announceChannel) return;
   try {
-    const { embed, components } = buildEpisodeEmbed(ep, idx, total);
-    await announceChannel.send({ embeds: [embed], components });
+    const { embed, components } = buildEpisodeEmbed(ep, idx, total, starterUserId);
+    const msg = await announceChannel.send({ embeds: [embed], components });
+    lastNowPlayingMessage = { channelId: announceChannel.id, messageId: msg.id };
   } catch (e) {
     console.warn('⚠️  Failed to send announcement:', e?.message || e);
   }
+}
+
+async function postResumeTagIfNeeded(epTitle) {
+  if (!announceChannel || !pendingStarterUserId) return;
+  try {
+    await announceChannel.send(`🎧 Started by <@${pendingStarterUserId}> — ${epTitle}`);
+  } catch {}
+}
+
+// Helper: update controls row (swap Pause ↔ Resume)
+async function updateControlsRow(isPaused) {
+  if (!lastNowPlayingMessage) return;
+  try {
+    const ch = await client.channels.fetch(lastNowPlayingMessage.channelId).catch(() => null);
+    if (!ch || !ch.isTextBased?.()) return;
+    const msg = await ch.messages.fetch(lastNowPlayingMessage.messageId).catch(() => null);
+    if (!msg) return;
+
+    // Keep first row (Open Episode link) as-is if present, replace or append the controls row
+    const newControls = buildControlsRow(isPaused);
+    const existingComponents = msg.components || [];
+    const otherRows = existingComponents.filter(r => !r.components?.some(c => [BTN_IDS.PAUSE, BTN_IDS.RESUME, BTN_IDS.SKIP, BTN_IDS.RESTART].includes(c.customId)));
+    const rows = [...otherRows, newControls];
+    await msg.edit({ components: rows });
+  } catch {}
 }
 
 // ───────────────────── Main Playback ─────────────────────
@@ -249,6 +317,7 @@ async function playCurrent() {
 
     currentEpisode = episodes[episodeIndex % episodes.length];
 
+    // We only announce on NEW episode start (not mid-episode resume)
     const isNewEpisodeStart = resumeOffsetMs === 0 && episodeIndex !== lastAnnouncedEpisodeIdx;
 
     console.log(`▶️  Now Playing (${episodeIndex + 1}/${episodes.length}): ${currentEpisode.title}${resumeOffsetMs ? ` (resume @ ${hms(resumeOffsetMs)})` : ''}`);
@@ -269,16 +338,28 @@ async function playCurrent() {
       }
     }, STARTUP_WATCHDOG_MS);
 
-    ffmpegProc.stdout.once('data', () => {
+    ffmpegProc.stdout.once('data', async () => {
       gotData = true;
       clearTimeout(watchdog);
       startedAtMs = Date.now();
       console.log('✅ Audio stream started.');
-      // Announce ONLY when a new episode begins (not on resume/restart)
+
+      // Announce ONLY when a new episode begins
       if (isNewEpisodeStart) {
         lastAnnouncedEpisodeIdx = episodeIndex;
-        announceEpisodeStart(currentEpisode, episodeIndex, episodes.length);
+        // SR1: if we got here via auto-resume (paused due to empty VC previously),
+        // include "Started by" in the announcement embed.
+        const starterId = pendingStarterUserId;
+        await announceEpisodeStart(currentEpisode, episodeIndex, episodes.length, starterId || null);
+      } else {
+        // If this is a mid-episode resume (under threshold), optionally post a one-liner tag
+        if (pendingStarterUserId) {
+          await postResumeTagIfNeeded(currentEpisode.title);
+        }
       }
+
+      // Clear pending starter id after we've announced or posted tag
+      pendingStarterUserId = null;
     });
 
     const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.OggOpus });
@@ -365,7 +446,7 @@ async function ensureConnection() {
   }
 }
 
-// ───────────────────── Pause / Resume + First Listener ─────────────────────
+// ───────────────────── Pause / Resume + First Listener + SR1 tagging ─────────────────────
 client.on('voiceStateUpdate', (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
@@ -388,6 +469,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   if (!hasStartedPlayback) {
     hasStartedPlayback = true;
     console.log('🎧 First listener joined — starting playback.');
+    // SR1 says: do NOT tag initial start from boot
     loopPlay();
     return;
   }
@@ -395,6 +477,10 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   const overThreshold = resumeOffsetMs >= RESUME_RESTART_THRESHOLD_MS;
 
   if (isPausedDueToEmpty) {
+    // Identify the "starter" (the joiner that triggered resume)
+    const joiner = newState?.member && !newState.member.user.bot ? newState.member : humans.first();
+    pendingStarterUserId = joiner ? joiner.id : null;
+
     if (overThreshold) {
       console.log(`🔁 Returning listener — episode played ${hms(resumeOffsetMs)}, above 5m threshold, restarting from the beginning.`);
       resumeOffsetMs = 0;
@@ -406,6 +492,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
       playCurrent();
     }
   } else if (player.state.status === AudioPlayerStatus.Paused) {
+    // Paused for another reason (manual pause). SR1: no tag here.
     if (overThreshold) {
       console.log(`🔁 Returning listener — episode played ${hms(resumeOffsetMs)}, above 5m threshold, restarting from the beginning.`);
       resumeOffsetMs = 0;
@@ -417,7 +504,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   }
 });
 
-// ───────────────────── Slash Commands: handlers ─────────────────────
+// ───────────────────── Slash Command Handlers (Tier 1) ─────────────────────
 async function handleNowPlaying(interaction) {
   if (!currentEpisode) {
     await interaction.reply({ content: 'Nothing playing yet.', ephemeral: true });
@@ -475,6 +562,7 @@ async function handlePause(interaction) {
   try { ffmpegProc?.kill('SIGKILL'); } catch {}
   ffmpegProc = null;
   await interaction.reply({ content: `⏸️ Paused @ ${hms(resumeOffsetMs)}.`, ephemeral: true });
+  await updateControlsRow(true);
 }
 
 async function handleResume(interaction) {
@@ -484,25 +572,80 @@ async function handleResume(interaction) {
   isPausedDueToEmpty = false;
   await interaction.reply({ content: `▶️ Resuming ${currentEpisode ? currentEpisode.title : 'playback'}…`, ephemeral: true });
   playCurrent();
+  await updateControlsRow(false);
+}
+
+// ───────────────────── Button Interactions (Tier 5-A) ─────────────────────
+function isMemberInVoice(interaction) {
+  const member = interaction.member;
+  const vch = member?.voice?.channelId;
+  return vch && vch === VOICE_CHANNEL_ID;
 }
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
   try {
-    switch (interaction.commandName) {
-      case 'nowplaying': return handleNowPlaying(interaction);
-      case 'skip':       return handleSkip(interaction);
-      case 'restart':    return handleRestart(interaction);
-      case 'pause':      return handlePause(interaction);
-      case 'resume':     return handleResume(interaction);
-      default: return interaction.reply({ content: 'Unknown command.', ephemeral: true });
+    if (interaction.isChatInputCommand()) {
+      switch (interaction.commandName) {
+        case 'nowplaying': return handleNowPlaying(interaction);
+        case 'skip':       return handleSkip(interaction);
+        case 'restart':    return handleRestart(interaction);
+        case 'pause':      return handlePause(interaction);
+        case 'resume':     return handleResume(interaction);
+        default: return interaction.reply({ content: 'Unknown command.', ephemeral: true });
+      }
+    } else if (interaction.isButton()) {
+      // Only allow users in the same VC to control (Option 2)
+      if (!isMemberInVoice(interaction)) {
+        return interaction.reply({ content: 'You must be in the same voice channel to control playback.', ephemeral: true });
+      }
+      switch (interaction.customId) {
+        case BTN_IDS.PAUSE: {
+          if (player.state.status !== AudioPlayerStatus.Playing) return interaction.reply({ content: 'Already paused.', ephemeral: true });
+          const elapsed = Math.max(0, Date.now() - (startedAtMs || Date.now()));
+          resumeOffsetMs += elapsed;
+          isPausedDueToEmpty = true;
+          try { player.pause(); } catch {}
+          try { ffmpegProc?.kill('SIGKILL'); } catch {}
+          ffmpegProc = null;
+          await interaction.reply({ content: `⏸️ Paused @ ${hms(resumeOffsetMs)}.`, ephemeral: true });
+          await updateControlsRow(true);
+          break;
+        }
+        case BTN_IDS.RESUME: {
+          if (player.state.status === AudioPlayerStatus.Playing && !isPausedDueToEmpty) return interaction.reply({ content: 'Already playing.', ephemeral: true });
+          isPausedDueToEmpty = false;
+          await interaction.reply({ content: `▶️ Resuming ${currentEpisode ? currentEpisode.title : 'playback'}…`, ephemeral: true });
+          playCurrent();
+          await updateControlsRow(false);
+          break;
+        }
+        case BTN_IDS.SKIP: {
+          if (!episodes.length) return interaction.reply({ content: 'No episodes loaded.', ephemeral: true });
+          resumeOffsetMs = 0;
+          episodeIndex = (episodeIndex + 1) % episodes.length;
+          await interaction.reply({ content: `⏭️ Skipping to episode #${(episodeIndex % episodes.length) + 1}: ${episodes[episodeIndex].title}`, ephemeral: true });
+          playCurrent();
+          break;
+        }
+        case BTN_IDS.RESTART: {
+          if (!currentEpisode) return interaction.reply({ content: 'Nothing to restart.', ephemeral: true });
+          resumeOffsetMs = 0;
+          await interaction.reply({ content: `🔁 Restarting: ${currentEpisode.title}`, ephemeral: true });
+          playCurrent();
+          break;
+        }
+        default:
+          await interaction.reply({ content: 'Unknown control.', ephemeral: true });
+      }
     }
   } catch (e) {
-    console.error('❌ Command error:', e);
-    if (interaction.deferred || interaction.replied) {
-      try { await interaction.followUp({ content: 'Command failed.', ephemeral: true }); } catch {}
-    } else {
-      try { await interaction.reply({ content: 'Command failed.', ephemeral: true }); } catch {}
+    console.error('❌ Interaction error:', e);
+    if (interaction.isRepliable()) {
+      if (interaction.deferred || interaction.replied) {
+        try { await interaction.followUp({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+      } else {
+        try { await interaction.reply({ content: 'Something went wrong.', ephemeral: true }); } catch {}
+      }
     }
   }
 });
@@ -518,7 +661,6 @@ const COMMANDS = [
 
 async function registerSlashCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-
   try {
     if (GUILD_ID) {
       await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: COMMANDS });
@@ -526,7 +668,6 @@ async function registerSlashCommands() {
     } else {
       console.warn('⚠️  GUILD_ID not set — skipping guild command registration.');
     }
-
     await rest.put(Routes.applicationCommands(APP_ID), { body: COMMANDS });
     console.log('✅ Global commands registered (hard sync).');
   } catch (e) {
@@ -538,14 +679,12 @@ async function registerSlashCommands() {
 async function main() {
   await sodium.ready;
 
-  // 1) Register slash commands (guild + global), hard sync
   await registerSlashCommands();
 
-  // 2) Login bot
   await client.login(DISCORD_TOKEN);
   console.log(`✅ Logged in as ${client.user?.tag}`);
 
-  // 3) Resolve announce channel (optional)
+  // Resolve announce channel (optional)
   if (ANNOUNCE_CHANNEL_ID) {
     try {
       const ch = await client.channels.fetch(ANNOUNCE_CHANNEL_ID);
@@ -560,7 +699,6 @@ async function main() {
     }
   }
 
-  // 4) Feed + Voice
   await fetchEpisodes();
   setInterval(fetchEpisodes, REFRESH_RSS_MS);
 
