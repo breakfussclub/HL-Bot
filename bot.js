@@ -15,38 +15,38 @@ import { spawn } from 'node:child_process';
 import ffmpeg from 'ffmpeg-static';
 import sodium from 'libsodium-wrappers';
 
-// ─── Env ──────────────────────────────────────────────────────────────────────
+// ─────────────────────────── ENV ───────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL } = process.env;
 if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
   console.error('Missing env. Set DISCORD_TOKEN, VOICE_CHANNEL_ID, RSS_URL');
   process.exit(1);
 }
 
-// ─── Config (bandwidth + stability) ───────────────────────────────────────────
-const REFRESH_RSS_MS = 60 * 60 * 1000;     // refresh feed hourly
+// ─────────────────────── Config / Tunables ─────────────────
+const REFRESH_RSS_MS = 60 * 60 * 1000;           // refresh feed hourly
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
 
-// FFmpeg opus: clean stereo, still efficient
-const OPUS_BITRATE = '96k';
-const OPUS_CHANNELS = '2';
-const OPUS_APP = 'audio';                  // better for music + voice
+const OPUS_BITRATE = '96k';                      // Option A (quality)
+const OPUS_CHANNELS = '2';                       // stereo
+const OPUS_APP = 'audio';
 
-// Headers for remote servers (ffmpeg will use these via -headers)
 const FETCH_UA = 'Mozilla/5.0 (PodcastPlayer/1.0; +https://discord.com)';
 const FETCH_ACCEPT = 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8';
 
-// ─── Discord Client / Voice Player ────────────────────────────────────────────
+// Startup / stall tolerance: some hosts are slow, give them time
+const STARTUP_WATCHDOG_MS = 20000;               // 20s before declaring "no bytes"
+
+// ───────────────── Discord client / player ────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
-// Keep connection alive even without subscribers
 const player = createAudioPlayer({
   behaviors: { noSubscriber: NoSubscriberBehavior.Play }
 });
 
-// ─── Presence helpers ─────────────────────────────────────────────────────────
+// ───────────────────── Presence helpers ────────────────────
 function cleanTitleForStatus(title) {
   if (!title) return 'Podcast';
   let t = String(title)
@@ -64,7 +64,7 @@ function setListeningStatus(title) {
   } catch {}
 }
 
-// ─── RSS Handling ─────────────────────────────────────────────────────────────
+// ───────────────────── RSS fetching / order ───────────────
 const parser = new Parser({ headers: { 'User-Agent': 'discord-podcast-radio/1.0' } });
 let episodes = [];
 let episodeIndex = 0;
@@ -82,8 +82,7 @@ async function fetchEpisodes() {
         };
       })
       .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
-    // Ascending time: oldest → newest
-    items.sort((a, b) => a.pubDate - b.pubDate);
+    items.sort((a, b) => a.pubDate - b.pubDate); // oldest → newest
     if (items.length) {
       episodes = items;
       console.log(`RSS Loaded: ${episodes.length} episodes`);
@@ -93,21 +92,42 @@ async function fetchEpisodes() {
   }
 }
 
-// ─── FFmpeg: URL → OGG/Opus (with timestamp seek) ────────────────────────────
-// We let FFmpeg fetch the URL directly so -ss seeking works reliably.
-function spawnFfmpegFromUrl(url, offsetMs = 0) {
-  const seekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
+// ──────────────── URL preflight (resolve redirects) ─────────
+async function resolveFinalUrl(urlIn) {
+  // We intentionally let fetch follow redirects so we can capture final URL
+  const res = await fetch(urlIn, {
+    method: 'GET',
+    redirect: 'follow',
+    headers: {
+      'User-Agent': FETCH_UA,
+      'Accept': FETCH_ACCEPT,
+      // Some hosts need an explicit Range to start quickly; small initial range helps
+      'Range': 'bytes=0-'
+    }
+  });
 
-  // Multi-line headers (CRLF) for ffmpeg HTTP
-  const headerBlob = `User-Agent: ${FETCH_UA}\r\nAccept: ${FETCH_ACCEPT}\r\n`;
+  // We don't actually read the body here; we just want final URL + cookies then abort
+  const finalUrl = res.url || urlIn;
+  const setCookie = res.headers.get('set-cookie') || '';
+  try { res.body?.cancel(); } catch {}
+  return { finalUrl, cookie: setCookie };
+}
+
+// ───────────── FFmpeg spawn (SR2 accurate seek) ────────────
+// SR2 requires -ss AFTER -i so FFmpeg decodes accurately.
+function spawnFfmpegFromUrlResolved(finalUrl, cookie, offsetMs = 0) {
+  const seekSec = Math.max(0, Math.floor(offsetMs / 1000)).toString();
+  const headerBlob =
+    `User-Agent: ${FETCH_UA}\r\n` +
+    `Accept: ${FETCH_ACCEPT}\r\n` +
+    (cookie ? `Cookie: ${cookie}\r\n` : '');
 
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-    // Accurate seek for MP3 over HTTP: place -ss AFTER -i; slower but correct.
     '-headers', headerBlob,
-    '-i', url,
-    '-ss', seekSec,
+    '-i', finalUrl,
+    '-ss', seekSec,             // SR2: accurate seek (after -i)
     '-vn',
     '-ac', OPUS_CHANNELS,
     '-ar', '48000',
@@ -128,15 +148,15 @@ function spawnFfmpegFromUrl(url, offsetMs = 0) {
   return child;
 }
 
-// ─── Playback State ───────────────────────────────────────────────────────────
-let hasStartedPlayback = false;     // starts only when first listener joins
-let isPausedDueToEmpty = false;     // we paused because VC is empty
-let resumeOffsetMs = 0;             // accumulated position within current episode
-let startedAtMs = 0;                // monotonic start time for current run
-let ffmpegProc = null;              // current ffmpeg process (kill on pause)
-let currentEpisode = null;          // {title, url, pubDate}
+// ─────────────── Playback state & utilities ────────────────
+let hasStartedPlayback = false;     // start only when first listener joins
+let isPausedDueToEmpty = false;     // paused because VC empty
+let resumeOffsetMs = 0;             // cumulative offset into current episode
+let startedAtMs = 0;                // timestamp when current run began
+let ffmpegProc = null;              // current ffmpeg process
+let currentEpisode = null;          // {title,url,pubDate}
+let playLock = false;               // prevent overlapping plays
 
-// ─── Playback Loop (timestamp-resumable) ─────────────────────────────────────
 function msToHMS(ms) {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
@@ -145,34 +165,38 @@ function msToHMS(ms) {
   return (h ? `${h}:` : '') + `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
 }
 
+// ───────────────────── Main play / loop logic ──────────────
 async function playCurrent() {
-  if (!episodes.length) {
-    console.log('No episodes yet; retry in 30s…');
-    setTimeout(loopPlay, 30_000);
-    return;
-  }
-
-  currentEpisode = episodes[episodeIndex % episodes.length];
-  console.log(`▶️  Now Playing: ${currentEpisode.title}${resumeOffsetMs ? ` (from ${msToHMS(resumeOffsetMs)})` : ''}`);
-  setListeningStatus(currentEpisode.title);
+  if (playLock) return;
+  playLock = true;
 
   try {
-    // Spawn ffmpeg directly from URL with -ss seek
-    ffmpegProc = spawnFfmpegFromUrl(currentEpisode.url, resumeOffsetMs);
+    if (!episodes.length) {
+      console.log('No episodes yet; retry in 30s…');
+      setTimeout(loopPlay, 30_000);
+      return;
+    }
 
-    // Simple watchdog in case remote stalls
+    currentEpisode = episodes[episodeIndex % episodes.length];
+    console.log(`▶️  Now Playing: ${currentEpisode.title}${resumeOffsetMs ? ` (from ${msToHMS(resumeOffsetMs)})` : ''}`);
+    setListeningStatus(currentEpisode.title);
+
+    // Preflight to get final URL + cookies (some hosts block direct FFmpeg)
+    const { finalUrl, cookie } = await resolveFinalUrl(currentEpisode.url);
+
+    ffmpegProc = spawnFfmpegFromUrlResolved(finalUrl, cookie, resumeOffsetMs);
+
     let gotData = false;
     const watchdog = setTimeout(() => {
       if (!gotData && !isPausedDueToEmpty) {
-        console.warn('No audio bytes after 8s — skipping episode.');
+        console.warn('No audio bytes after startup window — skipping episode.');
         try { ffmpegProc?.kill('SIGKILL'); } catch {}
         ffmpegProc = null;
-        // Advance to next episode
         resumeOffsetMs = 0;
         episodeIndex = (episodeIndex + 1) % episodes.length;
         setTimeout(loopPlay, 1500);
       }
-    }, 8000);
+    }, STARTUP_WATCHDOG_MS);
 
     ffmpegProc.stdout.once('data', () => {
       gotData = true;
@@ -189,10 +213,11 @@ async function playCurrent() {
     isPausedDueToEmpty = false;
   } catch (err) {
     console.error('Playback error:', err?.message || err);
-    // advance to next episode on failure
     resumeOffsetMs = 0;
     episodeIndex = (episodeIndex + 1) % episodes.length;
     setTimeout(loopPlay, 2000);
+  } finally {
+    playLock = false;
   }
 }
 
@@ -204,7 +229,6 @@ function loopPlay() {
   });
 }
 
-// When track naturally ends, move to next episode and reset offset
 player.on(AudioPlayerStatus.Idle, () => {
   if (isPausedDueToEmpty) return; // paused—do nothing
   resumeOffsetMs = 0;
@@ -215,13 +239,12 @@ player.on(AudioPlayerStatus.Idle, () => {
 player.on('error', err => {
   console.error('AudioPlayer error:', err?.message || err);
   if (isPausedDueToEmpty) return;
-  // On error, advance but keep running
   resumeOffsetMs = 0;
   episodeIndex = (episodeIndex + 1) % episodes.length;
   setTimeout(loopPlay, 2000);
 });
 
-// ─── Voice Connection + Keep-Alive (prevents AFK disconnect) ──────────────────
+// ─────────────── Voice connection & keep-alive ─────────────
 let connection = null;
 let keepAliveInterval = null;
 
@@ -272,17 +295,16 @@ async function ensureConnection() {
   }
 }
 
-// ─── Auto Pause/Resume + Wait-for-First-Listener (with timestamp resume) ─────
+// ───────────── Auto pause/resume + wait for listener ───────
 client.on('voiceStateUpdate', (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
 
   const humans = channel.members.filter(m => !m.user.bot);
 
-  // Empty: pause stream & record timestamp
+  // Empty: pause and record timestamp
   if (humans.size === 0) {
     if (player.state.status === AudioPlayerStatus.Playing) {
-      // accumulate elapsed into resumeOffsetMs
       const elapsed = Math.max(0, Date.now() - (startedAtMs || Date.now()));
       resumeOffsetMs += elapsed;
       isPausedDueToEmpty = true;
@@ -300,12 +322,10 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   if (!hasStartedPlayback) {
     hasStartedPlayback = true;
     console.log('[VC] First listener joined — starting playback.');
-    // begin loop
     loopPlay();
     return;
   }
 
-  // If we paused due to empty, resume by spawning ffmpeg at the saved offset
   if (isPausedDueToEmpty) {
     console.log(`[VC] Listener joined — resuming from ${msToHMS(resumeOffsetMs)}.`);
     isPausedDueToEmpty = false;
@@ -316,7 +336,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   }
 });
 
-// ─── Boot ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────── Boot ──────────────────────────
 async function main() {
   await sodium.ready;
   await client.login(DISCORD_TOKEN);
@@ -327,7 +347,7 @@ async function main() {
 
   await ensureConnection();
   console.log('[VC] Waiting for listeners… (will start on first join)');
-  // We intentionally do NOT call loopPlay() here; we wait for the first listener.
+  // Intentionally do not call loopPlay() here; wait for first listener.
 }
 
 process.on('SIGTERM', () => {
