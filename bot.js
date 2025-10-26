@@ -24,6 +24,9 @@ if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !RSS_URL) {
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
+// Bandwidth savers: lower opus bitrate + mono; wait-to-start; pause-when-empty
+const OPUS_BITRATE = process.env.OPUS_BITRATE || '64k'; // podcast-friendly
+const OPUS_CHANNELS = process.env.OPUS_CHANNELS || '1'; // mono saves ~50%
 const REFRESH_RSS_MS = 60 * 60 * 1000; // refresh feed hourly
 const REJOIN_DELAY_MS = 5000;
 const SELF_DEAFEN = true;
@@ -37,9 +40,29 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
+// Keep connection alive even without subscribers
 const player = createAudioPlayer({
   behaviors: { noSubscriber: NoSubscriberBehavior.Play }
 });
+
+// ─── Presence helpers ─────────────────────────────────────────────────────────
+function cleanTitleForStatus(title) {
+  if (!title) return 'Podcast';
+  let t = String(title)
+    .replace(/\.[^/.]+$/, '')      // drop extension if any
+    .replace(/[-_]+/g, ' ')        // nicer spacing
+    .replace(/\s+/g, ' ')          // collapse spaces
+    .trim();
+  // Capitalize words
+  t = t.replace(/\b\w/g, c => c.toUpperCase());
+  return t || 'Podcast';
+}
+
+function setListeningStatus(title) {
+  try {
+    client.user?.setActivity(cleanTitleForStatus(title), { type: 2 }); // LISTENING
+  } catch {}
+}
 
 // ─── RSS Handling ─────────────────────────────────────────────────────────────
 const parser = new Parser({ headers: { 'User-Agent': 'discord-podcast-radio/1.0' } });
@@ -60,6 +83,7 @@ async function fetchEpisodes() {
       })
       .filter(x => typeof x.url === 'string' && x.url.startsWith('http'));
 
+    // Ascending by time so we loop oldest→newest
     items.sort((a, b) => a.pubDate - b.pubDate);
     if (items.length) {
       episodes = items;
@@ -85,18 +109,20 @@ async function getAudioReadable(url) {
   return Readable.fromWeb(res.body);
 }
 
-// ─── FFmpeg: stdin MP3 → stdout OGG/Opus (Discord-compatible) ─────────────────
+// ─── FFmpeg: stdin MP3/AAC/etc → stdout OGG/Opus (low bandwidth) ─────────────
 function ffmpegOggOpus(readable) {
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-    '-f', 'mp3',
+    '-f', 'mp3',                // many podcast feeds are mp3; ffmpeg will auto-detect if not exact
     '-i', 'pipe:0',
     '-vn',
-    '-ac', '2',
+    '-ac', OPUS_CHANNELS,       // 1 = mono
     '-ar', '48000',
     '-c:a', 'libopus',
-    '-b:a', '128k',
+    '-b:a', OPUS_BITRATE,       // 64k default (good for voice)
+    '-application', 'voip',     // opus tuning optimized for speech
+    '-frame_duration', '60',    // fewer packets per second → tiny overhead savings
     '-f', 'ogg',
     'pipe:1'
   ];
@@ -114,7 +140,9 @@ function ffmpegOggOpus(readable) {
   return child.stdout;
 }
 
-// ─── Playback Loop ────────────────────────────────────────────────────────────
+// ─── Playback Loop (will begin only when we have a listener) ──────────────────
+let hasStartedPlayback = false;
+
 async function playCurrent() {
   if (!episodes.length) {
     console.log('No episodes yet; retrying in 30s…');
@@ -124,6 +152,7 @@ async function playCurrent() {
 
   const ep = episodes[episodeIndex % episodes.length];
   console.log(`▶️  Now Playing: ${ep.title}`);
+  setListeningStatus(ep.title);
 
   try {
     const inputReadable = await getAudioReadable(ep.url);
@@ -158,6 +187,8 @@ async function playCurrent() {
 }
 
 function loopPlay() {
+  // Only proceed if we have started playback (i.e., at least one listener joined)
+  if (!hasStartedPlayback) return;
   playCurrent().catch(err => {
     console.error('Loop error:', err?.message || err);
     setTimeout(loopPlay, 5_000);
@@ -175,8 +206,25 @@ player.on('error', err => {
   setTimeout(loopPlay, 2_000);
 });
 
-// ─── Voice Connection ─────────────────────────────────────────────────────────
+// ─── Voice Connection + Keep-Alive (prevents AFK disconnect) ──────────────────
 let connection = null;
+let keepAliveInterval = null;
+
+function startKeepAlive(conn) {
+  stopKeepAlive();
+  // Light-weight keep-alive to keep the networking stack refreshed while paused/idle
+  keepAliveInterval = setInterval(() => {
+    try { conn?.configureNetworking(); } catch {}
+  }, 15000);
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+}
+
 async function ensureConnection() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
   if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID must be a voice channel.');
@@ -200,14 +248,46 @@ async function ensureConnection() {
         setTimeout(() => {
           try { connection?.destroy(); } catch {}
           connection = null;
-          ensureConnection();
+          ensureConnection().catch(() => {});
         }, REJOIN_DELAY_MS);
       }
     });
 
     connection.subscribe(player);
+    startKeepAlive(connection);
   }
 }
+
+// ─── Auto Pause/Resume + Wait-for-First-Listener ─────────────────────────────
+client.on('voiceStateUpdate', (oldState, newState) => {
+  const channel = oldState.channel || newState.channel;
+  if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
+
+  const humans = channel.members.filter(m => !m.user.bot);
+
+  // Empty: pause ONLY if currently playing
+  if (humans.size === 0) {
+    if (player.state.status === AudioPlayerStatus.Playing) {
+      player.pause();
+      console.log('[VC] No listeners — pausing playback.');
+    }
+    return;
+  }
+
+  // Someone joined:
+  if (!hasStartedPlayback) {
+    hasStartedPlayback = true;
+    console.log('[VC] First listener joined — starting playback.');
+    // Kick off the loop from here
+    loopPlay();
+    return;
+  }
+
+  if (player.state.status === AudioPlayerStatus.Paused) {
+    player.unpause();
+    console.log('[VC] Listener joined — resuming playback.');
+  }
+});
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 async function main() {
@@ -219,10 +299,12 @@ async function main() {
   setInterval(fetchEpisodes, REFRESH_RSS_MS);
 
   await ensureConnection();
-  loopPlay();
+  console.log('[VC] Waiting for listeners… (will start on first join)');
+  // Do NOT call loopPlay() here; we wait for the first listener.
 }
 
 process.on('SIGTERM', () => {
+  try { stopKeepAlive(); } catch {}
   try { connection?.destroy(); } catch {}
   process.exit(0);
 });
